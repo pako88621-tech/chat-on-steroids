@@ -1,4 +1,6 @@
 import type {
+  ControlChangesDto,
+  ControlSemanticEventDto,
   ControlHealthSnapshot,
   ControlHttpResponse,
   ControlInputDto,
@@ -16,6 +18,16 @@ import {
   waitForEvidence,
 } from './evidence.js';
 import { sanitizeOutboundString } from './evidence-sanitizer.js';
+import { projectSemanticControlEvent } from './semantic-events.js';
+import {
+  checkpointStateForTurn,
+  classifySemanticWait,
+  emptyTerminalSettleState,
+  type CheckpointState,
+  type SemanticProjectedEvent,
+  type SemanticWaitMode,
+  type TerminalSettleState,
+} from './semantic-wait.js';
 import {
   IdempotencyError,
   acquireIdempotencyController,
@@ -38,6 +50,8 @@ import {
 } from './session-selector.js';
 
 const INPUT_LOOKUP_LIMIT = 500;
+const SEMANTIC_EVENT_PAGE_SIZE = 100;
+const CONTROL_RESTART_GRACE_MS = 5_000;
 const PRESTART_TIMEOUT_DETAIL = 'the action did not start and will not run; it is safe to send again';
 
 type OrchestratorErrorCode = NonNullable<ExternalOrchestrateResponse['error']>['code'];
@@ -45,11 +59,35 @@ type EvidenceErrorCode = NonNullable<ExternalEvidenceResponse['error']>['code'];
 
 interface ServiceControlClient extends SessionSelectionClient {
   health(): Promise<ControlHealthSnapshot>;
+  currentHealth(): ControlHealthSnapshot | null;
+  supportsSemanticWait(health?: ControlHealthSnapshot | null): boolean;
+  snapshotChanges(options?: ControlRequestOptions): Promise<ControlChangesDto>;
+  waitForChange(
+    cursor: { instanceId: string; after: number },
+    options?: { timeoutMs?: number; signal?: AbortSignal },
+  ): Promise<ControlChangesDto>;
   sanitizationTokens(): readonly string[];
   listInputs(options?: { state?: readonly string[]; limit?: number }): Promise<ControlInputsPageDto>;
   readEvents(sessionId: string, options?: { from?: number; before?: number; after?: number; limit?: number; kinds?: readonly string[] }): Promise<{ events: unknown[]; total: number; nextFrom: number }>;
+  readSemanticEvents(
+    sessionId: string,
+    options?: { from?: number; before?: number; after?: number; limit?: number; kinds?: readonly string[] },
+  ): Promise<{ events: ControlSemanticEventDto[]; total: number; nextFrom: number }>;
   get<T = unknown>(path: string, options?: ControlRequestOptions): Promise<ControlHttpResponse<T>>;
-  post<T = unknown>(path: string, body: unknown, options?: ControlRequestOptions): Promise<ControlHttpResponse<T>>;
+  post<T = unknown>(
+    path: string,
+    body: unknown,
+    options?: ControlRequestOptions,
+    beforeMutation?: () => Promise<void>,
+  ): Promise<ControlHttpResponse<T>>;
+}
+
+interface SemanticSessionMemory {
+  cursor: number | null;
+  checkpoint: CheckpointState;
+  settle: TerminalSettleState;
+  initialized: boolean;
+  lastTurnStartSeq: number | null;
 }
 
 interface MutationController {
@@ -128,6 +166,7 @@ function fixedMessage(code: OrchestratorErrorCode, override?: string): string {
     busy: 'External Orchestrator cannot safely admit another mutation right now.',
     rate_limited: 'Chat On Steroids is rate limiting Local Control requests.',
     delivery_unknown: 'The mutation outcome is unknown; reconcile state before issuing a different request.',
+    wait_unavailable: 'Semantic wait is unavailable until the Local Control change feed is supported.',
     internal_error: 'External Orchestrator could not complete the request safely.',
   };
   return messages[code];
@@ -136,6 +175,30 @@ function fixedMessage(code: OrchestratorErrorCode, override?: string): string {
 function stateFor(selection: SelectedSession, inputs: readonly ControlInputDto[]): 'idle' | 'working' {
   if (selection.live.activeTurnId) return 'working';
   return inputs.some((input) => input.sessionId === selection.session.id && input.delivery === 'pending') ? 'working' : 'idle';
+}
+
+function sameChangeCut(left: ControlChangesDto, right: ControlChangesDto): boolean {
+  return left.instanceId === right.instanceId && left.seq === right.seq;
+}
+
+function stateForSemantic(selection: SelectedSession): 'idle' | 'working' {
+  const work = selection.live.work;
+  return work?.state === 'quiescent' ? 'idle' : 'working';
+}
+
+function wakeSummary(reason: NonNullable<ExternalOrchestrateResponse['wake_reason']>, checkpoint?: string): string {
+  if (reason === 'checkpoint') return checkpoint ?? 'Prime reported a material checkpoint.';
+  const summaries: Record<Exclude<NonNullable<ExternalOrchestrateResponse['wake_reason']>, 'checkpoint'>, string> = {
+    blocked: 'Core reports that the supervised Prime is blocked.',
+    completed: 'Prime reached a canonical final result and Core is quiescent.',
+    failed: 'The supervised Prime turn failed.',
+    stalled: 'Core classified the supervised Prime turn as stalled.',
+    stopped: 'The supervised Prime turn stopped.',
+    control_lost: 'The supervised Core/session relationship changed and requires re-selection.',
+    transport_lease_expired: 'The transport compatibility lease expired; this is not a work-progress signal.',
+    activity: 'New recorded activity is available.',
+  };
+  return summaries[reason];
 }
 
 function inputBelongsTo(input: ControlInputDto, sessionId: string): boolean {
@@ -161,6 +224,21 @@ function settledMutationRefusalIsRetrySafe(response: ControlHttpResponse<unknown
   return true;
 }
 
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(new ControlClientError('request_aborted'));
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new ControlClientError('request_aborted'));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 export class ExternalOrchestratorService {
   readonly #client: ServiceControlClient;
   readonly #selector: SessionSelector;
@@ -170,6 +248,8 @@ export class ExternalOrchestratorService {
   #closePromise: Promise<void> | null = null;
   #shutdown = new AbortController();
   #inFlight = new Set<Promise<unknown>>();
+  #semanticWaitSessions = new Set<string>();
+  #semanticMemory = new Map<string, SemanticSessionMemory>();
 
   constructor(options: ExternalOrchestratorServiceOptions = {}) {
     const client = options.client ?? createControlClient();
@@ -210,7 +290,17 @@ export class ExternalOrchestratorService {
         case 'status':
           return await this.#status(health, request.session_id);
         case 'wait':
-          return await this.#wait(health, request.session_id, request.cursor, request.wait_ms, signal);
+          if ('wait_ms' in request) {
+            return await this.#wait(health, request.session_id, request.cursor, request.wait_ms, signal);
+          }
+          return await this.#semanticWait(
+            health,
+            request.session_id,
+            request.cursor,
+            request.until,
+            request.transport_lease_ms,
+            signal,
+          );
         case 'start':
           return await this.#send(health, 'start', {
             requestId: request.request_id,
@@ -324,6 +414,227 @@ export class ExternalOrchestratorService {
     });
   }
 
+  async #semanticWait(
+    health: ControlHealthSnapshot,
+    sessionId: string | undefined,
+    cursor: number | undefined,
+    mode: Exclude<SemanticWaitMode, 'activity'>,
+    transportLeaseMs: number | undefined,
+    signal?: AbortSignal,
+  ): Promise<ExternalOrchestrateResponse> {
+    if (!this.#client.supportsSemanticWait(health)) return this.#failure('wait_unavailable', health);
+    let selection = await this.#selector.select({ sessionId });
+    const id = selection.session.id;
+    if (this.#semanticWaitSessions.has(id)) return this.#failure('busy', health, selection);
+    this.#semanticWaitSessions.add(id);
+
+    const leaseDeadline = transportLeaseMs === undefined ? null : Date.now() + transportLeaseMs;
+    let memory = this.#semanticMemory.get(id);
+    if (!memory || (cursor !== undefined && memory.cursor !== cursor)) {
+      memory = {
+        cursor: cursor ?? null,
+        checkpoint: checkpointStateForTurn(null, false),
+        settle: emptyTerminalSettleState(),
+        // An explicit event cursor is a caller-owned observation boundary. A later canonical
+        // turn_start can therefore safely establish a fresh checkpoint budget. Attaching without
+        // a cursor remains conservative because prior checkpoint history may be unknowable.
+        initialized: cursor !== undefined,
+        lastTurnStartSeq: null,
+      };
+    }
+    let deferredCheckpoint: { summary?: string } | null = null;
+
+    try {
+      for (;;) {
+        if (signal?.aborted) throw new ControlClientError('request_aborted');
+        if (leaseDeadline !== null && Date.now() >= leaseDeadline) {
+          this.#semanticMemory.set(id, memory);
+          return this.#success(this.#client.currentHealth() ?? health, selection, {
+            state: stateForSemantic(selection),
+            cursor: memory.cursor ?? cursor ?? 0,
+            wake_reason: 'transport_lease_expired',
+            summary: wakeSummary('transport_lease_expired'),
+          });
+        }
+
+        const s0 = await this.#client.snapshotChanges({ signal });
+        const refreshed = await this.#selector.revalidateForRead(selection);
+        const work = refreshed.live.work;
+        if (!work) return this.#failure('wait_unavailable', health, refreshed);
+
+        const from: number | null = memory.cursor;
+        const page: { events: ControlSemanticEventDto[]; total: number; nextFrom: number } = from === null
+          ? await this.#client.readSemanticEvents(id, { limit: SEMANTIC_EVENT_PAGE_SIZE })
+          : await this.#client.readSemanticEvents(id, { from, limit: SEMANTIC_EVENT_PAGE_SIZE });
+        let caughtUp = from === null || page.events.length < SEMANTIC_EVENT_PAGE_SIZE;
+        if (!caughtUp) {
+          const lookahead = await this.#client.readSemanticEvents(id, { from: page.nextFrom, limit: 1 });
+          caughtUp = lookahead.events.length === 0;
+        }
+        const s1 = await this.#client.snapshotChanges({ signal });
+        if (!sameChangeCut(s0, s1)) {
+          // Stable-cut rule: none of the composite state above is committed.
+          continue;
+        }
+
+        selection = refreshed;
+        const projected: SemanticProjectedEvent[] = page.events
+          .map((event) => projectSemanticControlEvent(event, this.#client.sanitizationTokens()))
+          .filter((event): event is SemanticProjectedEvent => event !== null);
+
+        let checkpoint = memory.checkpoint;
+        const turnStarts = projected
+          .filter((event) => event.kind === 'turn_start' && typeof event.turnId === 'string')
+          .sort((left, right) => left.seq - right.seq);
+        const newestStart = turnStarts.at(-1);
+        if (newestStart && (memory.lastTurnStartSeq === null || newestStart.seq > memory.lastTurnStartSeq)) {
+          if (memory.initialized) checkpoint = checkpointStateForTurn(newestStart.turnId ?? null, true);
+          memory.lastTurnStartSeq = newestStart.seq;
+        }
+
+        const decision = classifySemanticWait({
+          mode,
+          cursor: from ?? 0,
+          events: projected,
+          work,
+          caughtUp,
+          checkpoint,
+          settle: memory.settle,
+        });
+        memory = {
+          cursor: page.nextFrom,
+          checkpoint: decision.checkpoint,
+          settle: decision.settle,
+          initialized: true,
+          lastTurnStartSeq: memory.lastTurnStartSeq,
+        };
+        this.#semanticMemory.set(id, memory);
+
+        // A bounded page may end before the stable recorder tail. Keep consuming immediately so an
+        // older checkpoint/turn cannot outrank a newer terminal/intervention in the same Core cut.
+        if (!caughtUp && decision.action === 'return' && decision.wakeReason === 'checkpoint') {
+          deferredCheckpoint ??= {
+            ...(decision.checkpointSummary === undefined ? {} : { summary: decision.checkpointSummary }),
+          };
+          continue;
+        }
+        if (!caughtUp && decision.action === 'return' && decision.wakeReason !== 'blocked') continue;
+        if (!caughtUp && decision.action === 'pending') continue;
+
+        if (decision.action === 'return') {
+          const selectedDecision = deferredCheckpoint !== null && decision.wakeReason === 'checkpoint'
+            ? { wakeReason: 'checkpoint' as const, checkpointSummary: deferredCheckpoint.summary }
+            : decision;
+          return this.#success(this.#client.currentHealth() ?? health, selection, {
+            state: stateForSemantic(selection),
+            cursor: memory.cursor ?? 0,
+            wake_reason: selectedDecision.wakeReason,
+            summary: wakeSummary(selectedDecision.wakeReason, selectedDecision.checkpointSummary),
+          });
+        }
+        if (deferredCheckpoint !== null) {
+          return this.#success(this.#client.currentHealth() ?? health, selection, {
+            state: stateForSemantic(selection),
+            cursor: memory.cursor ?? 0,
+            wake_reason: 'checkpoint',
+            summary: wakeSummary('checkpoint', deferredCheckpoint.summary),
+          });
+        }
+
+        const now = Date.now();
+        const coreRemaining = work.nextDeadline !== null && work.nextDeadline > now
+          ? work.nextDeadline - now
+          : work.nextDeadline !== null ? 0 : null;
+        const leaseRemaining = leaseDeadline === null ? null : Math.max(0, leaseDeadline - now);
+        if (coreRemaining === 0) continue;
+        if (leaseRemaining === 0) {
+          return this.#success(this.#client.currentHealth() ?? health, selection, {
+            state: stateForSemantic(selection),
+            cursor: memory.cursor ?? 0,
+            wake_reason: 'transport_lease_expired',
+            summary: wakeSummary('transport_lease_expired'),
+          });
+        }
+
+        let timeoutMs: number | undefined;
+        let timeoutKind: 'core' | 'lease' | null = null;
+        if (coreRemaining !== null && (leaseRemaining === null || coreRemaining <= leaseRemaining)) {
+          timeoutMs = coreRemaining;
+          timeoutKind = 'core';
+        } else if (leaseRemaining !== null) {
+          timeoutMs = leaseRemaining;
+          timeoutKind = 'lease';
+        }
+
+        try {
+          await this.#client.waitForChange(
+            { instanceId: s1.instanceId, after: s1.seq },
+            { ...(timeoutMs === undefined ? {} : { timeoutMs: Math.max(1, Math.trunc(timeoutMs)) }), signal },
+          );
+        } catch (error) {
+          if (error instanceof ControlClientError && error.code === 'request_timeout' && timeoutKind !== null) {
+            if (timeoutKind === 'core') continue;
+            return this.#success(this.#client.currentHealth() ?? health, selection, {
+              state: stateForSemantic(selection),
+              cursor: memory.cursor ?? 0,
+              wake_reason: 'transport_lease_expired',
+              summary: wakeSummary('transport_lease_expired'),
+            });
+          }
+          if (error instanceof ControlClientError && error.code === 'unsupported_control_api') {
+            return this.#success(this.#client.currentHealth() ?? health, selection, {
+              state: stateForSemantic(selection),
+              cursor: memory.cursor ?? 0,
+              wake_reason: 'control_lost',
+              summary: wakeSummary('control_lost'),
+            });
+          }
+          if (error instanceof ControlClientError && error.code === 'control_api_unavailable') {
+            if (await this.#recoverSemanticReadAfterRestart(signal)) continue;
+            return this.#success(this.#client.currentHealth() ?? health, selection, {
+              state: stateForSemantic(selection),
+              cursor: memory.cursor ?? 0,
+              wake_reason: 'control_lost',
+              summary: wakeSummary('control_lost'),
+            });
+          }
+          throw error;
+        }
+      }
+    } catch (error) {
+      if (error instanceof SessionSelectionError && error.code === 'session_ineligible') {
+        return this.#success(this.#client.currentHealth() ?? health, selection, {
+          state: 'working',
+          cursor: memory.cursor ?? cursor ?? 0,
+          wake_reason: 'control_lost',
+          summary: wakeSummary('control_lost'),
+        });
+      }
+      throw error;
+    } finally {
+      this.#semanticWaitSessions.delete(id);
+    }
+  }
+
+  async #recoverSemanticReadAfterRestart(signal?: AbortSignal): Promise<boolean> {
+    const deadline = Date.now() + CONTROL_RESTART_GRACE_MS;
+    let pause = 25;
+    for (;;) {
+      if (signal?.aborted) throw new ControlClientError('request_aborted');
+      try {
+        const health = await this.#client.health();
+        return this.#client.supportsSemanticWait(health);
+      } catch (error) {
+        if (!(error instanceof ControlClientError)
+            || !['control_api_unavailable', 'request_timeout'].includes(error.code)) throw error;
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return false;
+      await abortableDelay(Math.min(pause, remaining), signal);
+      pause = Math.min(pause * 2, 250);
+    }
+  }
+
   async #send(
     health: ControlHealthSnapshot,
     kind: 'start' | 'steer',
@@ -404,14 +715,13 @@ export class ExternalOrchestratorService {
 
     let response: ControlHttpResponse<unknown>;
     try {
-      await controller.assertOwned();
       response = await this.#client.post('/v1/inputs', {
         id: reservation.record.inputId,
         sessionId: selection.session.id,
         text: operation.text,
         interrupt: operation.interrupt,
         expectedConversationId: selection.conversationId,
-      }, { signal });
+      }, { signal }, () => controller.assertOwned());
     } catch (error) {
       if (error instanceof ControlClientError && error.ambiguous) {
         return this.#failure('delivery_unknown', health, selection, {
@@ -473,10 +783,11 @@ export class ExternalOrchestratorService {
     }
     if (settledMutationRefusalIsRetrySafe(response)) {
       const rejected = await this.#findInput(reservation.record.inputId);
-      if (rejected && remoteCode(response.body) !== 'id_conflict') {
+      if (rejected) {
         this.#assertInputOwnership(rejected, selection.session.id, selection.conversationId);
-        if (rejected.delivery === 'not_sent') await controller.markNotSent(reservation);
-        else await controller.markRetrySafe(reservation);
+        // A row that appeared after Core made this refusal may belong to another actor reusing the
+        // deterministic UUID. The projection cannot prove full text semantics, so leave this attempt
+        // unresolved. A later explicit replay must ask Core to compare the same UUID authoritatively.
       } else await controller.markRetrySafe(reservation);
     }
     return this.#remoteFailure(response, health, selection, reservation.record.inputId);
@@ -527,8 +838,12 @@ export class ExternalOrchestratorService {
     }
     let response: ControlHttpResponse<unknown>;
     try {
-      await controller.assertOwned();
-      response = await this.#client.post(`/v1/inputs/${encodeURIComponent(owned.inputId)}/cancel`, {}, { signal });
+      response = await this.#client.post(
+        `/v1/inputs/${encodeURIComponent(owned.inputId)}/cancel`,
+        {},
+        { signal },
+        () => controller.assertOwned(),
+      );
     } catch (error) {
       if (error instanceof ControlClientError && error.ambiguous) {
         return this.#failure('delivery_unknown', health, undefined, { input_id: owned.inputId, delivery: 'unconfirmed' });
@@ -564,8 +879,12 @@ export class ExternalOrchestratorService {
     if (selection.live.activeTurnId !== expectedTurnId) return this.#failure('active_turn_changed', health, selection);
     let response: ControlHttpResponse<unknown>;
     try {
-      await controller.assertOwned();
-      response = await this.#client.post(`/v1/sessions/${encodeURIComponent(sessionId)}/stop`, { expectedTurnId }, { signal });
+      response = await this.#client.post(
+        `/v1/sessions/${encodeURIComponent(sessionId)}/stop`,
+        { expectedTurnId },
+        { signal },
+        () => controller.assertOwned(),
+      );
     } catch (error) {
       if (error instanceof ControlClientError && error.ambiguous) return this.#failure('delivery_unknown', health, selection);
       throw error;
@@ -629,6 +948,7 @@ export class ExternalOrchestratorService {
       ...(extra.input_id === undefined ? {} : { input_id: extra.input_id }),
       active_turn_id: extra.active_turn_id === undefined ? selection.live.activeTurnId : extra.active_turn_id,
       ...(extra.delivery === undefined ? {} : { delivery: extra.delivery }),
+      ...(extra.wake_reason === undefined ? {} : { wake_reason: extra.wake_reason }),
     };
   }
 
@@ -654,6 +974,7 @@ export class ExternalOrchestratorService {
       ...(extra.input_id === undefined ? {} : { input_id: extra.input_id }),
       active_turn_id: selection?.live.activeTurnId ?? null,
       ...(extra.delivery === undefined ? {} : { delivery: extra.delivery }),
+      ...(extra.wake_reason === undefined ? {} : { wake_reason: extra.wake_reason }),
       error: { code, message: sanitizeOutboundString(fixedMessage(code, message), tokens) },
     };
   }

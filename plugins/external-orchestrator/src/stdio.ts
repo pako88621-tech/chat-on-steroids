@@ -1,19 +1,21 @@
 #!/usr/bin/env node
-import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
+import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import { createExternalOrchestratorService } from './orchestrator-service.js';
 import { createExternalOrchestratorMcpServer } from './server.js';
 
 const service = createExternalOrchestratorService();
-const server = createExternalOrchestratorMcpServer(service);
-const transport = new StdioServerTransport();
+const handle = serveStdio(
+  () => createExternalOrchestratorMcpServer(service),
+  { legacy: 'serve' },
+);
 let closing: Promise<void> | null = null;
 
 function close(): Promise<void> {
   if (closing) return closing;
   closing = (async () => {
-    const serverClosing = server.close().catch(() => undefined);
-    await service.close();
-    await serverClosing;
+    const transportClosing = handle.close().catch(() => undefined);
+    const serviceClosing = service.close().catch(() => undefined);
+    await Promise.all([transportClosing, serviceClosing]);
   })();
   return closing;
 }
@@ -21,10 +23,6 @@ function close(): Promise<void> {
 process.once('SIGTERM', () => { void close(); });
 process.once('SIGINT', () => { void close(); });
 process.stdin.once('end', () => { void close(); });
-
-try {
-  await server.connect(transport);
-} catch {
-  await close();
-  process.exitCode = 1;
-}
+process.stdin.once('close', () => { void close(); });
+process.stdin.once('error', () => { void close(); });
+process.stdout.once('error', () => { void close(); });

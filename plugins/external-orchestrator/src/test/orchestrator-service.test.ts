@@ -2,11 +2,13 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   ControlClientError,
+  type ControlChangesDto,
   type ControlHealthSnapshot,
   type ControlHttpResponse,
   type ControlInputDto,
   type ControlInputsPageDto,
   type ControlRequestOptions,
+  type ControlSemanticEventDto,
 } from '../control-client.js';
 import {
   IDEMPOTENCY_SCHEMA_VERSION,
@@ -24,6 +26,11 @@ import {
   formatSteerText,
 } from '../orchestrator-service.js';
 import { externalOrchestrateRequestSchema } from '../protocol.js';
+import {
+  FakeMonotonicClock,
+  QUIET_TRACE_MINUTES,
+  advanceQuietTrace,
+} from './benchmark-harness.js';
 import type {
   SessionSelectionDetail,
   SessionSelectionPage,
@@ -118,13 +125,27 @@ class FakeClient {
   tokens: string[] = [TOKEN];
   postQueue: Array<ControlHttpResponse<unknown> | Error> = [];
   postCalls: PostCall[] = [];
+  duringPostPreflight: (() => void | Promise<void>) | null = null;
   beforePost: (() => void) | null = null;
   healthCalls = 0;
   sessionReads = 0;
   inputReads = 0;
+  changesInstance = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  changesSeq = 0;
+  semanticEvents: ControlSemanticEventDto[] = [];
+  semanticReadFromCalls: Array<number | undefined> = [];
+  waitForChangeCalls: Array<{ instanceId: string; after: number; timeoutMs?: number }> = [];
+  waitForChangeHook: ((cursor: { instanceId: string; after: number }, options?: { timeoutMs?: number; signal?: AbortSignal }) => Promise<ControlChangesDto>) | null = null;
+  snapshotChangesHook: (() => Promise<ControlChangesDto>) | null = null;
+  snapshotChangeCalls = 0;
+  semanticReadCalls = 0;
 
   async health(): Promise<ControlHealthSnapshot> {
     this.healthCalls += 1;
+    return this.healthSnapshot;
+  }
+
+  currentHealth(): ControlHealthSnapshot | null {
     return this.healthSnapshot;
   }
 
@@ -150,6 +171,31 @@ class FakeClient {
     return { inputs: [...this.inputs], total: this.inputs.length };
   }
 
+  supportsSemanticWait(snapshot: ControlHealthSnapshot | null = this.healthSnapshot): boolean {
+    return snapshot !== null && snapshot.routes.includes('/v1/changes');
+  }
+
+  async snapshotChanges(): Promise<ControlChangesDto> {
+    this.snapshotChangeCalls += 1;
+    if (this.snapshotChangesHook) return this.snapshotChangesHook();
+    return { instanceId: this.changesInstance, seq: this.changesSeq, reason: 'snapshot' };
+  }
+
+  async waitForChange(
+    cursor: { instanceId: string; after: number },
+    options?: { timeoutMs?: number; signal?: AbortSignal },
+  ): Promise<ControlChangesDto> {
+    this.waitForChangeCalls.push({ ...cursor, ...(options?.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }) });
+    if (this.waitForChangeHook) return this.waitForChangeHook(cursor, options);
+    if (cursor.instanceId !== this.changesInstance) {
+      return { instanceId: this.changesInstance, seq: this.changesSeq, reason: 'reset' };
+    }
+    if (this.changesSeq > cursor.after) {
+      return { instanceId: this.changesInstance, seq: this.changesSeq, reason: 'changed' };
+    }
+    throw new Error('unexpected held change wait');
+  }
+
   async readEvents(
     _sessionId: string,
     _options?: { from?: number; before?: number; after?: number; limit?: number; kinds?: readonly string[] },
@@ -157,11 +203,33 @@ class FakeClient {
     return { events: [], total: 0, nextFrom: this.nextFrom };
   }
 
+  async readSemanticEvents(
+    _sessionId: string,
+    options: { from?: number; before?: number; after?: number; limit?: number; kinds?: readonly string[] } = {},
+  ): Promise<{ events: ControlSemanticEventDto[]; total: number; nextFrom: number }> {
+    this.semanticReadCalls += 1;
+    this.semanticReadFromCalls.push(options.from);
+    const limit = options.limit ?? 50;
+    const from = options.from;
+    const filtered = from === undefined
+      ? this.semanticEvents.slice(-limit)
+      : this.semanticEvents.filter((event) => event.seq >= from).slice(0, limit);
+    const nextFrom = filtered.reduce((value, event) => Math.max(value, event.seq + 1), from ?? 0);
+    return { events: filtered, total: this.semanticEvents.length, nextFrom: filtered.length ? nextFrom : from ?? this.nextFrom };
+  }
+
   async get<T = unknown>(_path: string, _options?: ControlRequestOptions): Promise<ControlHttpResponse<T>> {
     throw new Error('unexpected GET');
   }
 
-  async post<T = unknown>(path: string, body: unknown, options?: ControlRequestOptions): Promise<ControlHttpResponse<T>> {
+  async post<T = unknown>(
+    path: string,
+    body: unknown,
+    options?: ControlRequestOptions,
+    beforeMutation?: () => Promise<void>,
+  ): Promise<ControlHttpResponse<T>> {
+    await this.duringPostPreflight?.();
+    if (beforeMutation) await beforeMutation();
     this.beforePost?.();
     this.postCalls.push({ path, body, options });
     const next = this.postQueue.shift() ?? response(202, { ok: true });
@@ -366,6 +434,298 @@ test('status reports working/idle state from live/outbox state and preserves the
   assert.equal(client.postCalls.length, 0);
 });
 
+function enableSemanticWait(
+  client: FakeClient,
+  work: NonNullable<NonNullable<SessionSelectionDetail['live']>['work']>,
+): void {
+  if (!client.healthSnapshot.routes.includes('/v1/changes')) {
+    client.healthSnapshot = { ...client.healthSnapshot, routes: [...client.healthSnapshot.routes, '/v1/changes'] };
+  }
+  client.detail.live = { ...(client.detail.live ?? { activeTurnId: null, blocked: '' }), work };
+}
+
+test('old Core keeps ordinary reads but reports semantic wait unavailable instead of polling', async () => {
+  const client = new FakeClient();
+  const api = service(client, new FakeController());
+  const result = await api.orchestrate(externalOrchestrateRequestSchema.parse({
+    action: 'wait', until: 'attention', session_id: SESSION_ID,
+  }));
+  assert.equal(result.ok, false);
+  assert.equal(result.error?.code, 'wait_unavailable');
+  assert.equal(client.semanticReadCalls, 0);
+  assert.equal(client.waitForChangeCalls.length, 0);
+  assert.equal((await api.orchestrate({ action: 'status', session_id: SESSION_ID })).ok, true);
+});
+
+test('semantic terminal wait returns only after canonical final/end agree with Core quiescence', async () => {
+  const client = new FakeClient();
+  enableSemanticWait(client, { state: 'quiescent', reasons: [], nextDeadline: null });
+  client.semanticEvents = [
+    { seq: 10, position: 10, time: 10, kind: 'turn_start', source: 'extension', turnId: TURN_ID },
+    { seq: 11, position: 11, time: 11, kind: 'assistant_message', source: 'extension', turnId: TURN_ID, final: true, state: 'final' },
+    { seq: 12, position: 12, time: 12, kind: 'turn_end', source: 'extension', turnId: TURN_ID, outcome: 'completed' },
+  ];
+  const api = service(client, new FakeController());
+  const result = await api.orchestrate(externalOrchestrateRequestSchema.parse({
+    action: 'wait', until: 'terminal', session_id: SESSION_ID,
+  }));
+  assert.equal(result.ok, true);
+  assert.equal(result.wake_reason, 'completed');
+  assert.equal(result.cursor, 13);
+  assert.equal(result.state, 'idle');
+  assert.equal(client.waitForChangeCalls.length, 0);
+});
+
+test('semantic wait parks once on the change broker and rereads only after invalidation', async () => {
+  const client = new FakeClient();
+  enableSemanticWait(client, { state: 'active', reasons: ['active_turn'], nextDeadline: null });
+  client.detail.live!.activeTurnId = TURN_ID;
+  client.semanticEvents = [
+    { seq: 20, position: 20, time: 20, kind: 'turn_start', source: 'extension', turnId: TURN_ID },
+  ];
+  client.waitForChangeHook = async (cursor) => {
+    assert.equal(cursor.after, 0);
+    client.semanticEvents.push(
+      { seq: 21, position: 21, time: 21, kind: 'assistant_message', source: 'extension', turnId: TURN_ID, final: true, state: 'final' },
+      { seq: 22, position: 22, time: 22, kind: 'turn_end', source: 'extension', turnId: TURN_ID, outcome: 'completed' },
+    );
+    client.detail.live = {
+      ...client.detail.live!,
+      activeTurnId: null,
+      work: { state: 'quiescent', reasons: [], nextDeadline: null },
+    };
+    client.changesSeq = 1;
+    return { instanceId: client.changesInstance, seq: 1, reason: 'changed' };
+  };
+  const api = service(client, new FakeController());
+  const result = await api.orchestrate(externalOrchestrateRequestSchema.parse({
+    action: 'wait', until: 'attention', session_id: SESSION_ID,
+  }));
+  assert.equal(result.wake_reason, 'completed');
+  assert.equal(client.waitForChangeCalls.length, 1);
+  assert.equal(client.semanticReadCalls, 2);
+});
+
+test('semantic attention preserves a deferred checkpoint while draining a bounded multi-page backlog', async () => {
+  const client = new FakeClient();
+  enableSemanticWait(client, { state: 'active', reasons: ['active_turn'], nextDeadline: null });
+  client.detail.live!.activeTurnId = TURN_ID;
+  client.semanticEvents = [
+    { seq: 1, position: 1, time: 1, kind: 'turn_start', source: 'extension', turnId: TURN_ID },
+    {
+      seq: 2, position: 2, time: 2, kind: 'tool_call', source: 'mcp', turnId: TURN_ID,
+      tool: {
+        callId: 'plan-1',
+        name: 'update_plan',
+        outcome: 'ok',
+        durationMs: 12,
+        attribution: 'request_id',
+        summary: { title: 'Updated the task plan', detail: '2 / 3 completed', tone: 'neutral', kind: 'session' },
+        changes: [],
+      },
+    },
+    ...Array.from({ length: 99 }, (_, index): ControlSemanticEventDto => ({
+      seq: index + 3,
+      position: index + 3,
+      time: index + 3,
+      kind: 'progress',
+      source: 'mcp',
+      turnId: TURN_ID,
+    })),
+  ];
+  const api = service(client, new FakeController());
+  const result = await api.orchestrate(externalOrchestrateRequestSchema.parse({
+    action: 'wait', until: 'attention', session_id: SESSION_ID, cursor: 1,
+  }));
+  assert.equal(result.ok, true);
+  assert.equal(result.wake_reason, 'checkpoint');
+  assert.match(result.summary ?? '', /Updated the task plan/i);
+  assert.equal(result.cursor, 102);
+  assert.equal(client.semanticReadCalls, 3, 'first page, lookahead, then the remaining stable-cut page');
+  assert.equal(client.waitForChangeCalls.length, 0, 'draining a retained backlog must not park after consuming its checkpoint');
+});
+
+test('an explicit semantic cursor overrides process-local cursor memory on every call', async () => {
+  const client = new FakeClient();
+  enableSemanticWait(client, { state: 'active', reasons: ['active_turn'], nextDeadline: null });
+  client.detail.live!.activeTurnId = TURN_ID;
+  client.waitForChangeHook = async () => { throw new ControlClientError('request_timeout'); };
+  const api = service(client, new FakeController());
+
+  const first = await api.orchestrate(externalOrchestrateRequestSchema.parse({
+    action: 'wait', until: 'attention', session_id: SESSION_ID, cursor: 10, transport_lease_ms: 1_000,
+  }));
+  assert.equal(first.wake_reason, 'transport_lease_expired');
+  const second = await api.orchestrate(externalOrchestrateRequestSchema.parse({
+    action: 'wait', until: 'attention', session_id: SESSION_ID, cursor: 100, transport_lease_ms: 1_000,
+  }));
+  assert.equal(second.wake_reason, 'transport_lease_expired');
+  assert.deepEqual(client.semanticReadFromCalls, [10, 100]);
+  assert.equal(second.cursor, 100);
+});
+
+test('semantic wait reports health from the rediscovered live epoch instead of its opening snapshot', async () => {
+  const client = new FakeClient();
+  enableSemanticWait(client, { state: 'active', reasons: ['active_turn'], nextDeadline: null });
+  client.detail.live!.activeTurnId = TURN_ID;
+  client.semanticEvents = [
+    { seq: 20, position: 20, time: 20, kind: 'turn_start', source: 'extension', turnId: TURN_ID },
+  ];
+  client.waitForChangeHook = async () => {
+    client.healthSnapshot = {
+      ...client.healthSnapshot,
+      actions: { ...client.healthSnapshot.actions, enabled: false },
+    };
+    client.semanticEvents.push(
+      { seq: 21, position: 21, time: 21, kind: 'assistant_message', source: 'extension', turnId: TURN_ID, final: true, state: 'final' },
+      { seq: 22, position: 22, time: 22, kind: 'turn_end', source: 'extension', turnId: TURN_ID, outcome: 'completed' },
+    );
+    client.detail.live = {
+      ...client.detail.live!,
+      activeTurnId: null,
+      work: { state: 'quiescent', reasons: [], nextDeadline: null },
+    };
+    client.changesSeq = 1;
+    return { instanceId: client.changesInstance, seq: 1, reason: 'changed' };
+  };
+  const api = service(client, new FakeController());
+  const result = await api.orchestrate(externalOrchestrateRequestSchema.parse({
+    action: 'wait', until: 'attention', session_id: SESSION_ID,
+  }));
+  assert.equal(result.wake_reason, 'completed');
+  assert.equal(result.actions_enabled, false);
+});
+
+test('real semantic service stays parked for virtual 20/60/180-minute quiet traces with zero periodic reads or timers', async () => {
+  for (const minutes of QUIET_TRACE_MINUTES) {
+    for (const mode of ['whole', 'seconds'] as const) {
+      const clock = new FakeMonotonicClock();
+      const client = new FakeClient();
+      enableSemanticWait(client, { state: 'active', reasons: ['active_turn'], nextDeadline: null });
+      client.detail.live!.activeTurnId = TURN_ID;
+      client.semanticEvents = [
+        { seq: 20, position: 20, time: 20, kind: 'turn_start', source: 'extension', turnId: TURN_ID },
+      ];
+      let armed!: () => void;
+      const armedPromise = new Promise<void>((resolve) => { armed = resolve; });
+      client.waitForChangeHook = async (_cursor, options) => {
+        armed();
+        return await new Promise<ControlChangesDto>((_resolve, reject) => {
+          const onAbort = () => reject(new ControlClientError('request_aborted'));
+          options?.signal?.addEventListener('abort', onAbort, { once: true });
+        });
+      };
+      const api = service(client, new FakeController());
+      const cancel = new AbortController();
+      let settled = false;
+      clock.install();
+      try {
+        const pending = api.orchestrate(externalOrchestrateRequestSchema.parse({
+          action: 'wait', until: 'attention', session_id: SESSION_ID,
+        }), cancel.signal).finally(() => { settled = true; });
+        await armedPromise;
+        const baseline = {
+          semanticReadCalls: client.semanticReadCalls,
+          snapshotChangeCalls: client.snapshotChangeCalls,
+          sessionReads: client.sessionReads,
+          waitForChangeCalls: client.waitForChangeCalls.length,
+        };
+        assert.equal(baseline.waitForChangeCalls, 1, `${minutes}m ${mode}: exactly one watch is armed`);
+        assert.equal(clock.pendingTimerCount, 0, `${minutes}m ${mode}: semantic wait owns no periodic timer`);
+
+        advanceQuietTrace(clock, minutes, mode);
+        await Promise.resolve();
+
+        assert.equal(settled, false, `${minutes}m ${mode}: no model result while Core is quiet`);
+        assert.equal(clock.timerFirings, 0, `${minutes}m ${mode}: no timer fired`);
+        assert.deepEqual({
+          semanticReadCalls: client.semanticReadCalls,
+          snapshotChangeCalls: client.snapshotChangeCalls,
+          sessionReads: client.sessionReads,
+          waitForChangeCalls: client.waitForChangeCalls.length,
+        }, baseline, `${minutes}m ${mode}: no periodic Core read or watch re-arm`);
+
+        cancel.abort();
+        await pending;
+      } finally {
+        clock.restore();
+        await api.close();
+      }
+    }
+  }
+});
+
+test('stable-cut fencing discards a torn composite before it can return a terminal result', async () => {
+  const client = new FakeClient();
+  enableSemanticWait(client, { state: 'quiescent', reasons: [], nextDeadline: null });
+  client.semanticEvents = [
+    { seq: 30, position: 30, time: 30, kind: 'assistant_message', source: 'extension', turnId: TURN_ID, final: true, state: 'final' },
+    { seq: 31, position: 31, time: 31, kind: 'turn_end', source: 'extension', turnId: TURN_ID, outcome: 'completed' },
+  ];
+  const cuts = [0, 1, 1, 1];
+  client.snapshotChangesHook = async () => ({
+    instanceId: client.changesInstance,
+    seq: cuts.shift() ?? 1,
+    reason: 'snapshot',
+  });
+  const api = service(client, new FakeController());
+  const result = await api.orchestrate(externalOrchestrateRequestSchema.parse({
+    action: 'wait', until: 'terminal', session_id: SESSION_ID,
+  }));
+  assert.equal(result.wake_reason, 'completed');
+  assert.equal(client.semanticReadCalls, 2, 'the torn first composite must be reread, not committed');
+});
+
+test('only one semantic wait per session is admitted and cancellation releases that ownership', async () => {
+  const client = new FakeClient();
+  enableSemanticWait(client, { state: 'active', reasons: ['active_turn'], nextDeadline: null });
+  let armed!: () => void;
+  const armedPromise = new Promise<void>((resolve) => { armed = resolve; });
+  client.waitForChangeHook = async (_cursor, options) => {
+    armed();
+    return await new Promise<ControlChangesDto>((_resolve, reject) => {
+      const onAbort = () => reject(new ControlClientError('request_aborted'));
+      options?.signal?.addEventListener('abort', onAbort, { once: true });
+    });
+  };
+  const api = service(client, new FakeController());
+  const request = externalOrchestrateRequestSchema.parse({
+    action: 'wait', until: 'attention', session_id: SESSION_ID,
+  });
+  const cancel = new AbortController();
+  const first = api.orchestrate(request, cancel.signal);
+  await armedPromise;
+  const duplicate = await api.orchestrate(request);
+  assert.equal(duplicate.error?.code, 'busy');
+  assert.equal(client.waitForChangeCalls.length, 1);
+  cancel.abort();
+  await first;
+
+  client.waitForChangeHook = async () => {
+    throw new ControlClientError('request_timeout');
+  };
+  const leased = await api.orchestrate(externalOrchestrateRequestSchema.parse({
+    action: 'wait', until: 'attention', session_id: SESSION_ID, transport_lease_ms: 1_000,
+  }));
+  assert.equal(leased.wake_reason, 'transport_lease_expired', 'aborted waiter must release same-session ownership');
+});
+
+test('transport lease expiration is a compatibility wake, never a synthetic progress checkpoint', async () => {
+  const client = new FakeClient();
+  enableSemanticWait(client, { state: 'waiting', reasons: ['goal_wait'], nextDeadline: null });
+  client.waitForChangeHook = async (_cursor, options) => {
+    assert(options?.timeoutMs !== undefined && options.timeoutMs > 0 && options.timeoutMs <= 1_000);
+    throw new ControlClientError('request_timeout');
+  };
+  const api = service(client, new FakeController());
+  const result = await api.orchestrate(externalOrchestrateRequestSchema.parse({
+    action: 'wait', until: 'attention', session_id: SESSION_ID, transport_lease_ms: 1_000,
+  }));
+  assert.equal(result.ok, true);
+  assert.equal(result.wake_reason, 'transport_lease_expired');
+  assert.match(result.summary ?? '', /not a work-progress signal/i);
+});
+
 test('actions disabled fails before controller acquisition or reservation', async () => {
   const client = new FakeClient();
   client.healthSnapshot = health(false);
@@ -460,6 +820,30 @@ test('steer posts its frozen framing unchanged', async () => {
     interrupt: false,
     expectedConversationId: 'conversation-1',
   });
+});
+
+test('controller takeover during client mutation preflight blocks start and steer before POST', async () => {
+  const requests = [
+    externalOrchestrateRequestSchema.parse({
+      action: 'start', objective: 'Ship', session_id: SESSION_ID, request_id: 'req.preflight.start',
+    }),
+    externalOrchestrateRequestSchema.parse({
+      action: 'steer', instruction: 'Adjust', session_id: SESSION_ID, request_id: 'req.preflight.steer',
+    }),
+  ];
+  for (const request of requests) {
+    const controller = new FakeController();
+    const client = new FakeClient();
+    client.duringPostPreflight = () => {
+      controller.assertOwnedError = new IdempotencyError('controller_lost', 'successor took controller lock');
+    };
+    const api = service(client, controller);
+
+    const result = await api.orchestrate(request);
+    assert.equal(result.error?.code, 'controller_busy');
+    assert.equal(client.postCalls.length, 0, `${request.action} must not cross POST after controller takeover`);
+    assert.equal(controller.assertOwnedCalls, 1);
+  }
 });
 
 test('accepted replay asks Core to prove exact semantics without issuing a second provider send', async () => {
@@ -693,6 +1077,118 @@ test('settled non-ambiguous refusal becomes retry_safe and only an explicit retr
   assert.deepEqual(client.postCalls.map((call) => (call.body as { id: string }).id), [
     deterministicInputId(requestId), deterministicInputId(requestId),
   ]);
+});
+
+test('settled refusal never terminalizes a foreign same-UUID not-sent row that appears after POST admission checks', async () => {
+  const requestId = 'req.refusal.foreign-tombstone-race';
+  const id = deterministicInputId(requestId);
+  const client = new FakeClient();
+  client.postQueue.push(
+    response(409, { error: 'would_interrupt' }, false),
+    response(409, { error: 'id_conflict' }, false),
+  );
+  let postCount = 0;
+  client.beforePost = () => {
+    postCount += 1;
+    if (postCount === 1) {
+      client.inputs = [input(id, {
+        delivery: 'not_sent',
+        state: 'cancelled',
+        text: { text: 'foreign semantic payload', chars: 24, truncated: false },
+      })];
+    }
+  };
+  const controller = new FakeController();
+  const api = service(client, controller);
+  const request = externalOrchestrateRequestSchema.parse({
+    action: 'start', objective: 'Ship', session_id: SESSION_ID, request_id: requestId,
+  });
+
+  const refused = await api.orchestrate(request);
+  assert.equal(refused.error?.code, 'would_interrupt');
+  assert.equal(controller.entries.get(requestId)?.record.state, 'reserved');
+  assert.equal(controller.notSentCalls.length, 0);
+  assert.equal(controller.retrySafeCalls.length, 0);
+  assert.equal(client.postCalls.length, 1);
+
+  const replayed = await api.orchestrate(request);
+  assert.equal(replayed.error?.code, 'duplicate_request_conflict');
+  assert.equal(controller.entries.get(requestId)?.record.state, 'conflict');
+  assert.equal(controller.conflictCalls.length, 1);
+  assert.equal(client.postCalls.length, 2, 'retained same-UUID row must be reconciled by an authoritative replay POST');
+});
+
+test('settled refusal reconciles a same-semantic not-sent row through Core before terminalizing it', async () => {
+  const requestId = 'req.refusal.same-tombstone-race';
+  const id = deterministicInputId(requestId);
+  const text = formatStartText('Ship', []);
+  const client = new FakeClient();
+  client.postQueue.push(
+    response(409, { error: 'would_interrupt' }, false),
+    response(200, { replayed: true }, false),
+  );
+  let postCount = 0;
+  client.beforePost = () => {
+    postCount += 1;
+    if (postCount === 1) {
+      client.inputs = [input(id, {
+        delivery: 'not_sent',
+        state: 'cancelled',
+        text: { text, chars: text.length, truncated: false },
+      })];
+    }
+  };
+  const controller = new FakeController();
+  const api = service(client, controller);
+  const request = externalOrchestrateRequestSchema.parse({
+    action: 'start', objective: 'Ship', session_id: SESSION_ID, request_id: requestId,
+  });
+
+  const refused = await api.orchestrate(request);
+  assert.equal(refused.error?.code, 'would_interrupt');
+  assert.equal(controller.entries.get(requestId)?.record.state, 'reserved');
+  assert.equal(controller.notSentCalls.length, 0);
+  assert.equal(controller.retrySafeCalls.length, 0);
+
+  const reconciled = await api.orchestrate(request);
+  assert.equal(reconciled.error?.code, 'request_not_sent');
+  assert.equal(reconciled.delivery, 'not_sent');
+  assert.equal(controller.entries.get(requestId)?.record.state, 'not_sent');
+  assert.equal(controller.notSentCalls.length, 1);
+  assert.equal(client.postCalls.length, 2, 'Core semantic replay must prove equality before terminal not_sent is persisted');
+});
+
+test('settled refusal with a same-UUID row fails closed if that row is pruned before explicit replay', async () => {
+  const requestId = 'req.refusal.pruned-tombstone-race';
+  const id = deterministicInputId(requestId);
+  const client = new FakeClient();
+  client.postQueue.push(response(409, { error: 'would_interrupt' }, false));
+  client.beforePost = () => {
+    client.inputs = [input(id, {
+      delivery: 'not_sent',
+      state: 'cancelled',
+      text: { text: 'foreign semantic payload', chars: 24, truncated: false },
+    })];
+  };
+  const controller = new FakeController();
+  const api = service(client, controller);
+  const request = externalOrchestrateRequestSchema.parse({
+    action: 'start', objective: 'Ship', session_id: SESSION_ID, request_id: requestId,
+  });
+
+  const refused = await api.orchestrate(request);
+  assert.equal(refused.error?.code, 'would_interrupt');
+  assert.equal(controller.entries.get(requestId)?.record.state, 'reserved');
+  assert.equal(controller.notSentCalls.length, 0);
+  assert.equal(controller.retrySafeCalls.length, 0);
+  assert.equal(client.postCalls.length, 1);
+
+  client.inputs = [];
+  const replayed = await api.orchestrate(request);
+  assert.equal(replayed.error?.code, 'delivery_unknown');
+  assert.equal(replayed.delivery, 'unconfirmed');
+  assert.equal(controller.entries.get(requestId)?.record.state, 'reserved');
+  assert.equal(client.postCalls.length, 1, 'pruning must not reopen mutation authority');
 });
 
 test('pre-POST control failure is retry_safe because no mutation request crossed the boundary', async () => {
@@ -977,6 +1473,23 @@ test('cancel optional session_id must match ledger ownership before any POST', a
   assert.equal(client.inputReads, 0, 'session mismatch should fail before looking up the Core input');
 });
 
+test('controller takeover during client mutation preflight blocks owned cancel before POST', async () => {
+  const requestId = 'req.cancel.preflight-takeover';
+  const controller = new FakeController();
+  controller.seed(requestId, recordFor(requestId, { state: 'accepted' }));
+  const client = new FakeClient();
+  client.inputs = [input(deterministicInputId(requestId), { delivery: 'pending' })];
+  client.duringPostPreflight = () => {
+    controller.assertOwnedError = new IdempotencyError('controller_lost', 'successor took controller lock');
+  };
+  const api = service(client, controller);
+
+  const result = await api.orchestrate({ action: 'cancel', request_id: requestId });
+  assert.equal(result.error?.code, 'controller_busy');
+  assert.equal(client.postCalls.length, 0);
+  assert.equal(controller.assertOwnedCalls, 1);
+});
+
 test('Stop fences the exact session and turn; stale turns do not POST and 202 reports admission only', async () => {
   const client = new FakeClient();
   client.detail = {
@@ -1044,6 +1557,21 @@ test('controller loss at the final Stop boundary is caught after target revalida
   const stopped = await api.orchestrate({ action: 'stop', session_id: SESSION_ID, expected_turn_id: TURN_ID });
   assert.equal(stopped.error?.code, 'controller_busy');
   assert.equal(client.postCalls.length, before, 'no Stop POST crosses the boundary after lock loss');
+});
+
+test('controller takeover during client mutation preflight blocks exact-turn Stop before POST', async () => {
+  const client = new FakeClient();
+  client.detail = { ...client.detail, live: { activeTurnId: TURN_ID, blocked: '' } };
+  const controller = new FakeController();
+  client.duringPostPreflight = () => {
+    controller.assertOwnedError = new IdempotencyError('controller_lost', 'successor took controller lock');
+  };
+  const api = service(client, controller);
+
+  const stopped = await api.orchestrate({ action: 'stop', session_id: SESSION_ID, expected_turn_id: TURN_ID });
+  assert.equal(stopped.error?.code, 'controller_busy');
+  assert.equal(client.postCalls.length, 0);
+  assert.equal(controller.assertOwnedCalls, 1);
 });
 
 test('actions-disabled race reports current action authority instead of stale health', async () => {

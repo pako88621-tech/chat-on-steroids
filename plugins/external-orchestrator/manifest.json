@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "chat-on-steroids-external-orchestrator",
   "display_name": "External Orchestrator",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Portable local MCP bridge that lets an external coding agent direct Chat On Steroids through its Local Control API.",
   "author": { "name": "Chat On Steroids" },
   "license": "MIT",

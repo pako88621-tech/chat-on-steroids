@@ -39,6 +39,7 @@ const bridgeModule = await import('../src/main/bridge.js');
 const inputModule = await import('../src/main/session/input.js');
 const readModelModule = await import('../src/main/session/read-model.js');
 const reads = await import('../src/main/control-reads.js');
+type WorkProjectionSources = import('../src/main/control-reads.js').WorkProjectionSources;
 
 let dir: string;
 let port = 0;
@@ -128,7 +129,7 @@ describe('read routes', () => {
   it('are listed by health and need the token like every other route', async () => {
     const health = await call('/v1/health');
     expect(health.body.routes).toEqual([
-      '/v1/health', '/v1/status', '/v1/sessions', '/v1/sessions/{id}', '/v1/sessions/{id}/events', '/v1/inputs', '/v1/agents', '/v1/log'
+      '/v1/health', '/v1/status', '/v1/changes', '/v1/sessions', '/v1/sessions/{id}', '/v1/sessions/{id}/events', '/v1/inputs', '/v1/agents', '/v1/log'
     ]);
     for (const route of ['/v1/sessions', `/v1/sessions/${sessionId}`, `/v1/sessions/${sessionId}/events`, '/v1/inputs', '/v1/agents', '/v1/log']) {
       expect((await call(route, {})).status).toBe(401);
@@ -237,22 +238,24 @@ describe('projectLive', () => {
     'unattributed', 'unattributed-wait', 'assistant-error', 'tab-recovery', 'thinking-failed',
     'native-busy', 'silence', 'post-reload', 'pickup'
   ] as const;
+  const quiescentWork = { state: 'quiescent' as const, reasons: [], nextDeadline: null };
 
   it('publishes exactly the named fields, and false or null for what the owner leaves out', () => {
-    const idle = reads.projectLive(controls());
+    const idle = reads.projectLive(controls(), quiescentWork);
     expect(Object.keys(idle).sort()).toEqual([
       'activeTurnId', 'automation', 'blocked', 'canInject', 'canSendDirectly', 'finishHeld', 'finishWaiting', 'goalWait',
-      'job', 'queueAtFinish', 'recovery', 'stopPending'
+      'job', 'queueAtFinish', 'recovery', 'stopPending', 'work'
     ]);
     expect(idle).toEqual({
       activeTurnId: null, stopPending: false, automation: 'off', blocked: '', canSendDirectly: false, canInject: false,
-      queueAtFinish: false, finishHeld: false, finishWaiting: false, goalWait: null, recovery: [], job: null
+      queueAtFinish: false, finishHeld: false, finishWaiting: false, goalWait: null, recovery: [], job: null,
+      work: quiescentWork
     });
 
     const busy = reads.projectLive(controls({
       activeTurnId: 'turn-9', stopPending: true, automation: 'loop', blocked: 'blocked', canSendDirectly: true, canInject: true,
       queueAtFinish: true, finishHeld: true, finishWaiting: true
-    }));
+    }), quiescentWork);
     expect(busy).toMatchObject({
       activeTurnId: 'turn-9', stopPending: true, automation: 'loop', blocked: 'blocked', canSendDirectly: true, canInject: true,
       queueAtFinish: true, finishHeld: true, finishWaiting: true
@@ -262,7 +265,7 @@ describe('projectLive', () => {
   it('reports each flag from its own field and no other', () => {
     const FLAGS = ['stopPending', 'canSendDirectly', 'canInject', 'queueAtFinish', 'finishHeld', 'finishWaiting'] as const;
     for (const flag of FLAGS) {
-      const only = reads.projectLive(controls({ [flag]: true } as Partial<SessionControlsView>));
+      const only = reads.projectLive(controls({ [flag]: true } as Partial<SessionControlsView>), quiescentWork);
       for (const other of FLAGS) expect(only[other], `${flag} set, reading ${other}`).toBe(other === flag);
     }
   });
@@ -270,24 +273,24 @@ describe('projectLive', () => {
   it('carries a job through each stage and send state, without its token or handles', () => {
     for (const stage of ['handoff-pending', 'opening', 'waiting-for-browser', 'done', 'failed'] as const) {
       const busy = stage !== 'done' && stage !== 'failed';
-      expect(reads.projectLive(controls({ job: job({ stage, busy, automatic: true }) })).job).toEqual({
+      expect(reads.projectLive(controls({ job: job({ stage, busy, automatic: true }) }), quiescentWork).job).toEqual({
         stage, startedAt: 1_000, automatic: true, busy, sourceSend: 'not-attempted', destinationSend: 'not-attempted', error: null
       });
     }
     for (const state of ['not-attempted', 'attempted-unresolved', 'dispatched-unresolved', 'sent'] as const) {
       const projected = reads.projectLive(controls({
         job: job({ sourceSend: { state, messageId: 'SENTINEL-SOURCE-MESSAGE' }, destinationSend: { state, conversationId: null, messageId: null } })
-      })).job;
+      }), quiescentWork).job;
       expect(projected).toMatchObject({ sourceSend: state, destinationSend: state });
     }
-    expect(Object.keys(reads.projectLive(controls({ job: job() })).job!).sort()).toEqual([
+    expect(Object.keys(reads.projectLive(controls({ job: job() }), quiescentWork).job!).sort()).toEqual([
       'automatic', 'busy', 'destinationSend', 'error', 'sourceSend', 'stage', 'startedAt'
     ]);
   });
 
   it('redacts and cuts a job error like any other free text', () => {
     const reason = `The browser refused: ${apiKey} ${'x'.repeat(2_000)}`;
-    const { error } = reads.projectLive(controls({ job: job({ stage: 'failed', busy: false, error: reason }) })).job!;
+    const { error } = reads.projectLive(controls({ job: job({ stage: 'failed', busy: false, error: reason }) }), quiescentWork).job!;
     expect(error).not.toContain(apiKey);
     expect(error).toContain('[redacted]');
     expect(error!.length).toBeLessThanOrEqual(300);
@@ -302,27 +305,107 @@ describe('projectLive', () => {
       conversationId: 'SENTINEL-CONVERSATION',
       sessionId: 'SENTINEL-SESSION'
     } as unknown as Partial<SessionControlsView>;
-    const json = JSON.stringify(reads.projectLive(controls({ ...hidden, job: job() })));
+    const json = JSON.stringify(reads.projectLive(controls({ ...hidden, job: job() }), quiescentWork));
     expect(json).not.toMatch(/SENTINEL/);
   });
 
   it('keeps every kind of wait, its deadline and what it leads to, and bounds how many', () => {
     const waits = KINDS.map((kind, index) => ({ kind, deadline: 5_000 + index }));
-    expect(reads.projectLive(controls({ recovery: waits })).recovery).toEqual(
+    expect(reads.projectLive(controls({ recovery: waits }), quiescentWork).recovery).toEqual(
       waits.map(({ kind, deadline }) => ({ kind, deadline, visibleAt: null, next: null, reload: false, generating: false }))
     );
     expect(reads.projectLive(controls({
       recovery: [{ kind: 'pickup', deadline: 9_000, visibleAt: 8_970, next: 'continue', reload: true, generating: true }]
-    })).recovery).toEqual([{ kind: 'pickup', deadline: 9_000, visibleAt: 8_970, next: 'continue', reload: true, generating: true }]);
+    }), quiescentWork).recovery).toEqual([{ kind: 'pickup', deadline: 9_000, visibleAt: 8_970, next: 'continue', reload: true, generating: true }]);
     const many = Array.from({ length: 40 }, (_, index) => ({ kind: 'silence' as const, deadline: index }));
-    expect(reads.projectLive(controls({ recovery: many })).recovery).toHaveLength(10);
+    expect(reads.projectLive(controls({ recovery: many }), quiescentWork).recovery).toHaveLength(10);
   });
 
   it('says why a goal has not moved yet, with the deadline only when there is one', () => {
     for (const reason of ['tools', 'workers', 'quiet', 'silence', 'listening', 'native-busy', 'settling'] as const) {
-      expect(reads.projectLive(controls({ goalWait: { reason } })).goalWait).toEqual({ reason, until: null });
+      expect(reads.projectLive(controls({ goalWait: { reason } }), quiescentWork).goalWait).toEqual({ reason, until: null });
     }
-    expect(reads.projectLive(controls({ goalWait: { reason: 'quiet', until: 12_345 } })).goalWait).toEqual({ reason: 'quiet', until: 12_345 });
+    expect(reads.projectLive(controls({ goalWait: { reason: 'quiet', until: 12_345 } }), quiescentWork).goalWait).toEqual({ reason: 'quiet', until: 12_345 });
+  });
+});
+
+describe('projectWork', () => {
+  const base = (over: Partial<WorkProjectionSources> = {}): WorkProjectionSources => ({
+    now: 1_000,
+    activeTurnId: null,
+    blocked: false,
+    runningTools: 0,
+    settlingTools: 0,
+    recoveryDeadlines: [],
+    goalWaiting: false,
+    goalProviderActive: false,
+    goalDeadline: null,
+    finishHeld: false,
+    finishWaiting: false,
+    jobBusy: false,
+    pendingInput: false,
+    inputSettled: true,
+    activityExpiresAt: null,
+    ...over,
+  });
+
+  it('uses the frozen work-state precedence without inventing a reason for an activity lease', () => {
+    expect(reads.projectWork(base())).toEqual({ state: 'quiescent', reasons: [], nextDeadline: null });
+    expect(reads.projectWork(base({ pendingInput: true }))).toEqual({
+      state: 'waiting', reasons: ['pending_input'], nextDeadline: null,
+    });
+    expect(reads.projectWork(base({ activityExpiresAt: 2_000, inputSettled: false }))).toEqual({
+      state: 'settling', reasons: [], nextDeadline: 2_000,
+    });
+    expect(reads.projectWork(base({ settlingTools: 1, pendingInput: true }))).toMatchObject({
+      state: 'settling', reasons: ['tool_activity', 'pending_input'],
+    });
+    expect(reads.projectWork(base({ runningTools: 1, settlingTools: 1 }))).toMatchObject({
+      state: 'active', reasons: ['tool_activity'],
+    });
+    expect(reads.projectWork(base({ activeTurnId: 'turn-1', blocked: true }))).toMatchObject({
+      state: 'blocked', reasons: ['active_turn', 'blocked'],
+    });
+  });
+
+  it('keeps work reasons in the frozen canonical order', () => {
+    expect(reads.projectWork(base({
+      activeTurnId: 'turn-1',
+      runningTools: 1,
+      recoveryDeadlines: [3_000],
+      goalWaiting: true,
+      finishHeld: true,
+      jobBusy: true,
+      pendingInput: true,
+      blocked: true,
+    })).reasons).toEqual([
+      'active_turn', 'tool_activity', 'recovery', 'goal_wait', 'finish_hold', 'job', 'pending_input', 'blocked',
+    ]);
+  });
+
+  it('selects only the earliest strictly-future Core-owned deadline', () => {
+    expect(reads.projectWork(base({
+      recoveryDeadlines: [900, 5_000, 2_500],
+      goalWaiting: true,
+      goalDeadline: 2_000,
+      inputSettled: false,
+      activityExpiresAt: 4_000,
+    })).nextDeadline).toBe(2_000);
+    expect(reads.projectWork(base({
+      recoveryDeadlines: [900],
+      goalDeadline: 1_000,
+      activityExpiresAt: 500,
+    }))).toEqual({
+      state: 'waiting',
+      reasons: ['recovery'],
+      nextDeadline: null,
+    });
+  });
+
+  it('does not let a display-only activity lease override canonical settled state', () => {
+    expect(reads.projectWork(base({ inputSettled: true, activityExpiresAt: 9_000 }))).toEqual({
+      state: 'quiescent', reasons: [], nextDeadline: null,
+    });
   });
 });
 
@@ -359,7 +442,12 @@ describe('sessions', () => {
       finishWaiting: false,
       goalWait: null,
       recovery: [],
-      job: null
+      job: null,
+      work: {
+        state: 'quiescent',
+        reasons: [],
+        nextDeadline: null
+      }
     });
     expect(Object.keys((await call(`/v1/sessions/${liveSessionId}`)).body)).toEqual(['session']);
   });

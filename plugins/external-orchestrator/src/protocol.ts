@@ -39,10 +39,34 @@ export const externalOrchestratorErrorCodeSchema = z.enum([
   'busy',
   'rate_limited',
   'delivery_unknown',
+  'wait_unavailable',
   'internal_error',
 ]);
 
-export const externalOrchestrateRequestSchema = z.discriminatedUnion('action', [
+const legacyWait = z.object({
+  action: z.literal('wait'),
+  session_id: externalSessionIdSchema.optional(),
+  cursor: cursor.optional(),
+  wait_ms: z.number().int().min(100).max(30_000).optional().default(15_000),
+}).strict();
+
+const activityWait = z.object({
+  action: z.literal('wait'),
+  session_id: externalSessionIdSchema.optional(),
+  cursor: cursor.optional(),
+  until: z.literal('activity'),
+  wait_ms: z.number().int().min(100).max(30_000).optional().default(15_000),
+}).strict();
+
+const semanticWait = (until: 'attention' | 'terminal') => z.object({
+  action: z.literal('wait'),
+  session_id: externalSessionIdSchema.optional(),
+  cursor: cursor.optional(),
+  until: z.literal(until),
+  transport_lease_ms: z.number().int().min(1_000).max(86_400_000).optional(),
+}).strict();
+
+export const externalOrchestrateRequestSchema = z.union([
   z.object({ action: z.literal('status'), session_id: externalSessionIdSchema.optional() }).strict(),
   z.object({
     action: z.literal('start'),
@@ -63,16 +87,27 @@ export const externalOrchestrateRequestSchema = z.discriminatedUnion('action', [
     request_id: requestId,
     interrupt: z.boolean().optional().default(false),
   }).strict(),
-  z.object({
-    action: z.literal('wait'),
-    session_id: externalSessionIdSchema.optional(),
-    cursor: cursor.optional(),
-    wait_ms: z.number().int().min(100).max(30_000).optional().default(15_000),
-  }).strict(),
+  legacyWait,
+  activityWait,
+  semanticWait('attention'),
+  semanticWait('terminal'),
   z.object({ action: z.literal('cancel'), session_id: externalSessionIdSchema.optional(), request_id: requestId }).strict(),
   z.object({ action: z.literal('stop'), session_id: externalSessionIdSchema, expected_turn_id: expectedTurnId }).strict(),
 ]);
 export type ExternalOrchestrateRequest = z.infer<typeof externalOrchestrateRequestSchema>;
+
+export const externalWakeReasonSchema = z.enum([
+  'checkpoint',
+  'blocked',
+  'completed',
+  'failed',
+  'stalled',
+  'stopped',
+  'control_lost',
+  'transport_lease_expired',
+  'activity',
+]);
+export type ExternalWakeReason = z.infer<typeof externalWakeReasonSchema>;
 
 export const externalOrchestrateResponseSchema = z.object({
   ok: z.boolean(),
@@ -87,6 +122,7 @@ export const externalOrchestrateResponseSchema = z.object({
   input_id: z.string().uuid().optional(),
   active_turn_id: expectedTurnId.nullable(),
   delivery: z.enum(['pending', 'sent', 'not_sent', 'unconfirmed']).optional(),
+  wake_reason: externalWakeReasonSchema.optional(),
   error: z.object({ code: externalOrchestratorErrorCodeSchema, message: z.string().max(2_000) }).strict().optional(),
 }).strict();
 export type ExternalOrchestrateResponse = z.infer<typeof externalOrchestrateResponseSchema>;

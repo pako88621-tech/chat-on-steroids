@@ -7,12 +7,15 @@ import type {
   ControlApiInputs,
   ControlApiLive,
   ControlApiLog,
+  ControlApiWork,
+  ControlApiWorkReason,
   ControlApiSession,
   ControlApiSessionDetail,
   ControlApiSessionList,
   ControlApiText
 } from '../shared/control-api.js';
 import { positionOf } from '../shared/chronology.js';
+import { sessionWorkingAt } from '../shared/session-activity.js';
 import { normalizedToolOutcome, toolCallSummary } from '../shared/session.js';
 import type { SessionEvent, SessionEventKind, SessionSummary, StoredText, SwarmState } from '../shared/session.js';
 import type { LogEntry } from '../shared/types.js';
@@ -20,9 +23,17 @@ import { userPromptText } from '../shared/user-prompt.js';
 import { swarmState } from './agents.js';
 import { sessionControlsFor } from './bridge.js';
 import type { SessionControlsView } from './bridge.js';
+import {
+  goalDraftBusy,
+  goalDraftNeedsIntervention,
+  goalDurabilityPendingFor,
+  goalPendingReplyDeadlineFor,
+  goalPendingReplyFor
+} from './goal.js';
 import { getLog, logWarn } from './logger.js';
+import { runningToolCalls, settlingToolCalls } from './mcp/call-context.js';
 import { redactSecretText } from './redaction.js';
-import { deliveryProof, listInputs } from './session/input.js';
+import { deliveryProof, listInputs, sessionInputPolicy } from './session/input.js';
 import type { InputEntry } from './session/input.js';
 import { readSession, readSessionEvents, readSessionList, sessionListCursorSchema } from './session/read-model.js';
 
@@ -53,6 +64,64 @@ const CHANGE_PATH_CAP = 200;
 const MAX_EVENTS = 100;
 /** A chat holds a handful of waits at once; the cap only bounds what a bad owner could hand over. */
 const MAX_RECOVERY = 10;
+
+export interface WorkProjectionSources {
+  now: number;
+  activeTurnId: string | null;
+  blocked: boolean;
+  runningTools: number;
+  settlingTools: number;
+  recoveryDeadlines: readonly number[];
+  goalWaiting: boolean;
+  goalProviderActive: boolean;
+  goalDeadline: number | null;
+  finishHeld: boolean;
+  finishWaiting: boolean;
+  jobBusy: boolean;
+  pendingInput: boolean;
+  inputSettled: boolean;
+  activityExpiresAt: number | null;
+}
+
+/** Fixed-order, text-free work truth from already-owned Core facts. */
+export function projectWork(sources: WorkProjectionSources): ControlApiWork {
+  const reasons: ControlApiWorkReason[] = [];
+  if (sources.activeTurnId) reasons.push('active_turn');
+  if (sources.runningTools > 0 || sources.settlingTools > 0) reasons.push('tool_activity');
+  if (sources.recoveryDeadlines.length > 0) reasons.push('recovery');
+  if (sources.goalWaiting || sources.goalProviderActive) reasons.push('goal_wait');
+  if (sources.finishHeld || sources.finishWaiting) reasons.push('finish_hold');
+  if (sources.jobBusy) reasons.push('job');
+  if (sources.pendingInput) reasons.push('pending_input');
+  if (sources.blocked) reasons.push('blocked');
+
+  const active = Boolean(sources.activeTurnId) || sources.runningTools > 0 || sources.goalProviderActive;
+  const activityDeadline = !sources.inputSettled && sources.activityExpiresAt !== null && sources.activityExpiresAt > sources.now
+    ? sources.activityExpiresAt
+    : null;
+  const settling = sources.settlingTools > 0 || activityDeadline !== null;
+  const state: ControlApiWork['state'] = sources.blocked
+    ? 'blocked'
+    : active
+      ? 'active'
+      : settling
+        ? 'settling'
+        : reasons.length > 0
+          ? 'waiting'
+          : 'quiescent';
+
+  const deadlines = [
+    ...sources.recoveryDeadlines,
+    sources.goalDeadline,
+    activityDeadline,
+  ].filter((value): value is number => value !== null && Number.isFinite(value) && value > sources.now);
+
+  return {
+    state,
+    reasons,
+    nextDeadline: deadlines.length > 0 ? Math.min(...deadlines) : null,
+  };
+}
 
 /**
  * Event pages and live session state can read a whole journal, however small the page. A burst
@@ -211,7 +280,7 @@ async function sessionList(params: URLSearchParams): Promise<ControlApiSessionLi
  * handles and stay in the app; the one message a job can carry is redacted and cut like any
  * other free text here.
  */
-export function projectLive(controls: SessionControlsView): ControlApiLive {
+export function projectLive(controls: SessionControlsView, work: ControlApiWork): ControlApiLive {
   const { job, goalWait } = controls;
   return {
     activeTurnId: controls.activeTurnId,
@@ -242,8 +311,58 @@ export function projectLive(controls: SessionControlsView): ControlApiLive {
           destinationSend: job.destinationSend.state,
           error: job.error ? line(job.error, SUMMARY_CAP) : null
         }
-      : null
+      : null,
+    work
   };
+}
+
+function futureMinimum(now: number, values: Array<number | null | undefined>): number | null {
+  const future = values.filter((value): value is number =>
+    typeof value === 'number' && Number.isFinite(value) && value > now);
+  return future.length ? Math.min(...future) : null;
+}
+
+async function workForSession(summary: SessionSummary, controls: SessionControlsView): Promise<ControlApiWork> {
+  const now = Date.now();
+  const conversationId = summary.conversationId;
+  const [policy, inputs] = await Promise.all([
+    sessionInputPolicy(summary.id),
+    listInputs()
+  ]);
+  const pendingInput = inputs.some((entry) =>
+    entry.purpose !== 'decision' &&
+    (entry.sessionId === summary.id || entry.deliveredSessionId === summary.id) &&
+    (entry.state === 'queued' || entry.state === 'browser' || entry.state === 'tool'));
+  const pendingGoal = conversationId ? goalPendingReplyFor(conversationId) : null;
+  const goalBusy = conversationId ? goalDraftBusy(conversationId) : false;
+  const goalDurability = conversationId ? goalDurabilityPendingFor(conversationId) : false;
+  const goalIntervention = conversationId ? goalDraftNeedsIntervention(conversationId) : false;
+  const recoveryDeadlines = (controls.recovery ?? [])
+    .map((wait) => wait.deadline)
+    .filter((deadline): deadline is number => Number.isFinite(deadline));
+  const goalDeadline = futureMinimum(now, [
+    controls.goalWait?.until,
+    pendingGoal?.listenUntil,
+    conversationId ? goalPendingReplyDeadlineFor(conversationId, now) : null,
+  ]);
+
+  return projectWork({
+    now,
+    activeTurnId: controls.activeTurnId,
+    blocked: controls.blocked !== '' || goalIntervention,
+    runningTools: conversationId ? runningToolCalls(conversationId) : 0,
+    settlingTools: conversationId ? settlingToolCalls(conversationId) : 0,
+    recoveryDeadlines,
+    goalWaiting: controls.goalWait != null || pendingGoal !== null || goalDurability,
+    goalProviderActive: goalBusy,
+    goalDeadline,
+    finishHeld: controls.finishHeld === true,
+    finishWaiting: controls.finishWaiting === true,
+    jobBusy: controls.job?.busy === true,
+    pendingInput,
+    inputSettled: policy.settled,
+    activityExpiresAt: sessionWorkingAt(summary, now) ? summary.activityExpiresAt ?? null : null,
+  });
 }
 
 async function sessionDetail(id: string, params: URLSearchParams): Promise<ControlApiSessionDetail> {
@@ -259,6 +378,7 @@ async function sessionDetail(id: string, params: URLSearchParams): Promise<Contr
     // cannot be read right now, leaves `live` null; the session itself was already read.
     try {
       const controls = await sessionControlsFor(id);
+      const work = await workForSession(summary, controls);
       // A compaction can move the session to a new chat while its live state is being worked out,
       // and then the session describes one chat and part of the state another. The chat has to be
       // the one the session was read with, both before and after.
@@ -266,7 +386,7 @@ async function sessionDetail(id: string, params: URLSearchParams): Promise<Contr
       if (controls.conversationId !== summary.conversationId || after?.conversationId !== summary.conversationId) {
         return { session, live: null };
       }
-      return { session, live: projectLive(controls) };
+      return { session, live: projectLive(controls, work) };
     } catch (error) {
       if (error instanceof Error && !/^(session_not_recorded|conversation_superseded|conversation_changed)$/.test(error.message)) {
         logWarn('control API: live state unavailable for a session: ' + error.message);

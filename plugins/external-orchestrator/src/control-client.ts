@@ -16,6 +16,7 @@ const HEALTH_TIMEOUT_MS = 5_000;
 const READ_TIMEOUT_MS = 17_500;
 const MUTATION_TIMEOUT_MS = 22_500;
 const MAX_CALL_TIMEOUT_MS = 30_000;
+const MAX_CHANGE_WAIT_TIMEOUT_MS = 24 * 60 * 60_000;
 
 export const REQUIRED_CONTROL_ROUTES = Object.freeze([
   '/v1/health',
@@ -35,6 +36,8 @@ export const REQUIRED_CONTROL_ACTION_ROUTES = Object.freeze([
 export const REQUIRED_CONTROL_ACTION_FEATURES = Object.freeze([
   'input_expected_conversation',
 ] as const);
+
+export const CONTROL_CHANGE_ROUTE = '/v1/changes' as const;
 
 export type ControlClientErrorCode =
   | 'control_api_unavailable'
@@ -98,19 +101,80 @@ export interface ControlSessionSummaryDto {
   title: string;
   conversationId: string | null;
   projectId: string | null;
+  startedAt?: number;
   updatedAt: number;
   endedAt: number | null;
+  events?: number;
+  userMessages?: number;
+  toolCalls?: number;
+  lastToolCallAt?: number | null;
+  lastAssistantFinalAt?: number | null;
+  lastTurnEndAt?: number | null;
+  activityExpiresAt?: number | null;
+  errors?: number;
+  toolRejected?: number;
+  toolInternalErrors?: number;
+  processExitNonzero?: number;
+  estimatedTokens?: number;
+  contextTokens?: number;
+  lastTurnOutcome?: string | null;
   activeTurnId: string | null;
+  model?: string | null;
+  agents?: string[];
   origin: { kind: string } | null;
+}
+
+export type ControlWorkStateDto = 'active' | 'waiting' | 'settling' | 'quiescent' | 'blocked';
+export type ControlWorkReasonDto =
+  | 'active_turn'
+  | 'tool_activity'
+  | 'recovery'
+  | 'goal_wait'
+  | 'finish_hold'
+  | 'job'
+  | 'pending_input'
+  | 'blocked';
+
+export interface ControlWorkDto {
+  state: ControlWorkStateDto;
+  reasons: ControlWorkReasonDto[];
+  nextDeadline: number | null;
+}
+
+export interface ControlRecoveryDto {
+  kind: string;
+  deadline: number;
+  visibleAt: number | null;
+  next: string | null;
+  reload: boolean;
+  generating: boolean;
+}
+
+export interface ControlJobDto {
+  stage: string;
+  startedAt: number;
+  automatic: boolean;
+  busy: boolean;
+  sourceSend: string;
+  destinationSend: string;
+  error: string | null;
 }
 
 export interface ControlSessionLiveDto {
   activeTurnId: string | null;
   stopPending: boolean;
+  automation?: string;
   blocked: string;
   canSendDirectly: boolean;
   canInject: boolean;
   queueAtFinish: boolean;
+  finishHeld?: boolean;
+  finishWaiting?: boolean;
+  goalWait?: { reason: string; until: number | null } | null;
+  recovery?: ControlRecoveryDto[];
+  job?: ControlJobDto | null;
+  /** Additive in the event-driven Core. Absence keeps older protocol-1 Core reads usable. */
+  work?: ControlWorkDto;
 }
 
 export interface ControlSessionDetailDto {
@@ -138,12 +202,25 @@ export interface ControlInputDto {
   conversationId: string | null;
   state: string;
   delivery: 'sent' | 'not_sent' | 'unconfirmed' | 'pending';
+  mode?: string;
+  transportIntent?: string | null;
   automatic: boolean;
   purpose: string | null;
   createdAt: number;
   dueAt: number;
+  offeredAt?: number | null;
+  deliveredAt?: number | null;
   sendAuthorizedAt: number | null;
+  requiresAuthorization?: boolean;
+  cancelledByUser?: boolean;
+  queueOrder?: number | null;
+  model?: string | null;
+  reasoningEffort?: string | null;
+  messageId?: string | null;
+  error?: string | null;
   text: ControlTextDto;
+  attachments?: number;
+  images?: number;
 }
 
 export interface ControlInputsPageDto {
@@ -200,6 +277,18 @@ export interface ControlEventDto {
   chars?: number;
 }
 
+export interface ControlSemanticEventDto extends Omit<ControlEventDto, 'tool'> {
+  tool?: {
+    callId: string;
+    name: string;
+    outcome: string;
+    durationMs: number;
+    attribution: string;
+    summary: { title: string; detail?: string; metric?: string; tone: string; kind: string };
+    changes: ControlEventChangeDto[];
+  };
+}
+
 export interface ControlEventsPageDto {
   events: ControlEventDto[];
   total: number;
@@ -217,6 +306,22 @@ export interface ControlReadEventsOptions {
   after?: number;
   limit?: number;
   kinds?: readonly string[];
+}
+
+export interface ControlChangesDto {
+  instanceId: string;
+  seq: number;
+  reason: 'snapshot' | 'changed' | 'reset';
+}
+
+export interface ControlChangeCursor {
+  instanceId: string;
+  after: number;
+}
+
+export interface ControlChangeWaitOptions {
+  timeoutMs?: number;
+  signal?: AbortSignal;
 }
 
 export class ControlRemoteError extends Error {
@@ -263,19 +368,90 @@ const sessionSummarySchema = z.object({
   title: z.string().max(2_000),
   conversationId: nullableBoundedString(256),
   projectId: nullableBoundedString(256),
+  startedAt: safeInteger.optional(),
   updatedAt: safeInteger,
   endedAt: safeInteger.nullable(),
+  events: safeInteger.optional(),
+  userMessages: safeInteger.optional(),
+  toolCalls: safeInteger.optional(),
+  lastToolCallAt: safeInteger.nullable().optional(),
+  lastAssistantFinalAt: safeInteger.nullable().optional(),
+  lastTurnEndAt: safeInteger.nullable().optional(),
+  activityExpiresAt: safeInteger.nullable().optional(),
+  errors: safeInteger.optional(),
+  toolRejected: safeInteger.optional(),
+  toolInternalErrors: safeInteger.optional(),
+  processExitNonzero: safeInteger.optional(),
+  estimatedTokens: safeInteger.optional(),
+  contextTokens: safeInteger.optional(),
+  lastTurnOutcome: nullableBoundedString(80).optional(),
   activeTurnId: nullableBoundedString(256),
+  model: nullableBoundedString(160).optional(),
+  agents: z.array(z.string().max(160)).max(64).optional(),
   origin: z.object({ kind: z.string().min(1).max(80) }).nullable(),
 });
+const WORK_REASON_ORDER = Object.freeze([
+  'active_turn',
+  'tool_activity',
+  'recovery',
+  'goal_wait',
+  'finish_hold',
+  'job',
+  'pending_input',
+  'blocked',
+] as const);
+const workReasonSchema = z.enum(WORK_REASON_ORDER);
+const workReasonsSchema = z.array(workReasonSchema).max(WORK_REASON_ORDER.length).superRefine((reasons, ctx) => {
+  let previous = -1;
+  for (let index = 0; index < reasons.length; index += 1) {
+    const order = WORK_REASON_ORDER.indexOf(reasons[index]!);
+    if (order <= previous) {
+      ctx.addIssue({ code: 'custom', message: 'work reasons must be unique and canonically ordered', path: [index] });
+      return;
+    }
+    previous = order;
+  }
+});
+const workSchema = z.object({
+  state: z.enum(['active', 'waiting', 'settling', 'quiescent', 'blocked']),
+  reasons: workReasonsSchema,
+  nextDeadline: safeInteger.nullable(),
+}).strict();
+const recoverySchema = z.object({
+  kind: z.string().min(1).max(80),
+  deadline: safeInteger,
+  visibleAt: safeInteger.nullable(),
+  next: nullableBoundedString(80),
+  reload: z.boolean(),
+  generating: z.boolean(),
+}).strict();
+const jobSchema = z.object({
+  stage: z.string().min(1).max(80),
+  startedAt: safeInteger,
+  automatic: z.boolean(),
+  busy: z.boolean(),
+  sourceSend: z.string().min(1).max(80),
+  destinationSend: z.string().min(1).max(80),
+  error: nullableBoundedString(2_000),
+}).strict();
 const sessionLiveSchema = z.object({
   activeTurnId: nullableBoundedString(256),
   stopPending: z.boolean(),
+  automation: z.string().max(80).optional(),
   blocked: z.string().max(80),
   canSendDirectly: z.boolean(),
   canInject: z.boolean(),
   queueAtFinish: z.boolean(),
-});
+  finishHeld: z.boolean().optional(),
+  finishWaiting: z.boolean().optional(),
+  goalWait: z.object({
+    reason: z.string().min(1).max(160),
+    until: safeInteger.nullable(),
+  }).strict().nullable().optional(),
+  recovery: z.array(recoverySchema).max(32).optional(),
+  job: jobSchema.nullable().optional(),
+  work: workSchema.optional(),
+}).strict();
 const sessionDetailSchema = z.object({
   session: sessionSummarySchema,
   live: sessionLiveSchema.nullable().optional(),
@@ -293,12 +469,25 @@ const controlInputSchema = z.object({
   conversationId: nullableBoundedString(256),
   state: z.string().min(1).max(80),
   delivery: z.enum(['sent', 'not_sent', 'unconfirmed', 'pending']),
+  mode: z.string().max(80).optional(),
+  transportIntent: nullableBoundedString(80).optional(),
   automatic: z.boolean(),
   purpose: nullableBoundedString(80),
   createdAt: safeInteger,
   dueAt: safeInteger,
+  offeredAt: safeInteger.nullable().optional(),
+  deliveredAt: safeInteger.nullable().optional(),
   sendAuthorizedAt: safeInteger.nullable(),
+  requiresAuthorization: z.boolean().optional(),
+  cancelledByUser: z.boolean().optional(),
+  queueOrder: safeInteger.nullable().optional(),
+  model: nullableBoundedString(160).optional(),
+  reasoningEffort: nullableBoundedString(80).optional(),
+  messageId: nullableBoundedString(256).optional(),
+  error: nullableBoundedString(2_000).optional(),
   text: controlTextSchema,
+  attachments: safeInteger.optional(),
+  images: safeInteger.optional(),
 });
 const inputsPageSchema = z.object({
   inputs: z.array(controlInputSchema).max(500),
@@ -326,6 +515,7 @@ const eventToolSchema = z.object({
   result: controlTextSchema,
   changes: z.array(eventChangeSchema).max(64),
 });
+const semanticEventToolSchema = eventToolSchema.omit({ args: true, result: true });
 const eventSchema = z.object({
   seq: safeInteger,
   position: safeInteger,
@@ -358,11 +548,22 @@ const eventSchema = z.object({
   handoffId: z.string().max(256).optional(),
   chars: safeInteger.optional(),
 });
+const semanticEventSchema = eventSchema.extend({ tool: semanticEventToolSchema.optional() });
 const eventsPageSchema = z.object({
   events: z.array(eventSchema).max(100),
   total: safeInteger,
   nextFrom: safeInteger,
 });
+const semanticEventsPageSchema = z.object({
+  events: z.array(semanticEventSchema).max(100),
+  total: safeInteger,
+  nextFrom: safeInteger,
+});
+const changesSchema = z.object({
+  instanceId: z.string().uuid(),
+  seq: safeInteger,
+  reason: z.enum(['snapshot', 'changed', 'reset']),
+}).strict();
 
 function isTransportFailure(value: unknown): value is TransportFailure {
   return !!value && typeof value === 'object' && (value as { kind?: unknown }).kind === 'transport';
@@ -371,6 +572,14 @@ function isTransportFailure(value: unknown): value is TransportFailure {
 function boundedTimeout(value: number | undefined, fallback: number): number {
   if (value === undefined) return fallback;
   if (!Number.isFinite(value) || value < 1 || value > MAX_CALL_TIMEOUT_MS) throw new ControlClientError('invalid_request');
+  return Math.floor(value);
+}
+
+function boundedChangeWaitTimeout(value: number | undefined): number | null {
+  if (value === undefined) return null;
+  if (!Number.isFinite(value) || value < 1 || value > MAX_CHANGE_WAIT_TIMEOUT_MS) {
+    throw new ControlClientError('invalid_request');
+  }
   return Math.floor(value);
 }
 
@@ -409,7 +618,7 @@ function requestJson(
   method: 'GET' | 'POST',
   path: string,
   body: unknown,
-  timeoutMs: number,
+  timeoutMs: number | null,
   signal?: AbortSignal,
 ): Promise<RawResponse> {
   if (!validPath(path)) return Promise.reject(new ControlClientError('invalid_request'));
@@ -429,10 +638,11 @@ function requestJson(
     let requestFinished = false;
     let timedOut = false;
     let aborted = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
     const finish = (error?: unknown, response?: RawResponse): void => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       signal?.removeEventListener('abort', onAbort);
       if (error !== undefined) reject(error);
       else resolve(response!);
@@ -500,12 +710,14 @@ function requestJson(
     req.once('error', (error: NodeJS.ErrnoException) => finish({
       kind: 'transport', code: error.code ?? null, connected, requestFinished, timeout: timedOut, aborted,
     } satisfies TransportFailure));
-    const timer = setTimeout(() => {
-      timedOut = true;
-      req.destroy();
-      finish({ kind: 'transport', code: null, connected, requestFinished, timeout: true, aborted: false } satisfies TransportFailure);
-    }, timeoutMs);
-    timer.unref?.();
+    if (timeoutMs !== null) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        req.destroy();
+        finish({ kind: 'transport', code: null, connected, requestFinished, timeout: true, aborted: false } satisfies TransportFailure);
+      }, timeoutMs);
+      timer.unref?.();
+    }
     const onAbort = (): void => {
       aborted = true;
       req.destroy();
@@ -561,20 +773,29 @@ function parseHealth(body: unknown, epoch: ControlEpoch): ControlHealthSnapshot 
       || typeof value.appVersion !== 'string' || value.appVersion.length > 160
       || typeof value.startedAt !== 'string' || value.startedAt.length > 80
       || typeof value.uptimeSeconds !== 'number' || !Number.isFinite(value.uptimeSeconds) || value.uptimeSeconds < 0
-      || routes === null || !actionsValue || typeof actionsValue !== 'object' || Array.isArray(actionsValue)) {
+      || routes === null || (actionsValue !== undefined
+        && (!actionsValue || typeof actionsValue !== 'object' || Array.isArray(actionsValue)))) {
     throw new ControlClientError('invalid_response');
   }
-  const actions = actionsValue as Record<string, unknown>;
-  const actionRoutes = stringArray(actions.routes);
-  const actionFeatures = stringArray(actions.features);
-  if (typeof actions.enabled !== 'boolean' || actionRoutes === null || actionFeatures === null) {
-    throw new ControlClientError('invalid_response');
+  let enabled = false;
+  let actionRoutes: string[] = [];
+  let actionFeatures: string[] = [];
+  if (actionsValue !== undefined) {
+    const actions = actionsValue as Record<string, unknown>;
+    const parsedRoutes = stringArray(actions.routes);
+    const parsedFeatures = stringArray(actions.features);
+    if (typeof actions.enabled !== 'boolean' || parsedRoutes === null || parsedFeatures === null) {
+      throw new ControlClientError('invalid_response');
+    }
+    enabled = actions.enabled;
+    actionRoutes = parsedRoutes;
+    actionFeatures = parsedFeatures;
   }
   return {
     ok: true,
     protocol: value.protocol as number,
     routes,
-    actions: { enabled: actions.enabled, routes: actionRoutes, features: actionFeatures },
+    actions: { enabled, routes: actionRoutes, features: actionFeatures },
     pid: value.pid as number,
     appVersion: value.appVersion,
     startedAt: value.startedAt,
@@ -583,13 +804,35 @@ function parseHealth(body: unknown, epoch: ControlEpoch): ControlHealthSnapshot 
   };
 }
 
-function hasRequiredRoutes(health: ControlHealthSnapshot): boolean {
+function hasRequiredBaseRoutes(health: ControlHealthSnapshot): boolean {
   const reads = new Set(health.routes);
-  const actions = new Set(health.actions.routes);
-  const features = new Set(health.actions.features);
-  return REQUIRED_CONTROL_ROUTES.every((route) => reads.has(route))
-    && REQUIRED_CONTROL_ACTION_ROUTES.every((route) => actions.has(route))
-    && REQUIRED_CONTROL_ACTION_FEATURES.every((feature) => features.has(feature));
+  return REQUIRED_CONTROL_ROUTES.every((route) => reads.has(route));
+}
+
+export function supportsSemanticWait(health: ControlHealthSnapshot): boolean {
+  return health.routes.includes(CONTROL_CHANGE_ROUTE);
+}
+
+function requiredMutationCapability(path: string): { route: string; feature?: string } | null {
+  if (path === '/v1/inputs') {
+    return { route: 'POST /v1/inputs', feature: 'input_expected_conversation' };
+  }
+  if (/^\/v1\/inputs\/[0-9a-f-]{36}\/cancel$/u.test(path)) {
+    return { route: 'POST /v1/inputs/{id}/cancel' };
+  }
+  if (/^\/v1\/sessions\/[0-9a-z-]{8,64}\/stop$/u.test(path)) {
+    return { route: 'POST /v1/sessions/{id}/stop' };
+  }
+  return null;
+}
+
+function requireMutationCapability(health: ControlHealthSnapshot, path: string): void {
+  const required = requiredMutationCapability(path);
+  if (!required) return;
+  if (!health.actions.routes.includes(required.route)
+      || (required.feature !== undefined && !health.actions.features.includes(required.feature))) {
+    throw new ControlClientError('unsupported_control_api');
+  }
 }
 
 function publicationError(error: unknown): ControlClientError {
@@ -645,6 +888,10 @@ export class ControlClient {
     return this.live?.publication.epoch ?? null;
   }
 
+  currentHealth(): ControlHealthSnapshot | null {
+    return this.live?.health ?? null;
+  }
+
   /** Internal-only redaction material. Never place these values in MCP output, logs or config. */
   sanitizationTokens(): readonly string[] {
     return [...this.redactionTokens];
@@ -659,7 +906,7 @@ export class ControlClient {
     this.redactionTokens = [token, ...this.redactionTokens.filter((value) => value !== token)].slice(0, 2);
   }
 
-  private async establishLive(previous?: ControlEpoch): Promise<LiveControlEpoch> {
+  private async establishLive(previous?: ControlEpoch, signal?: AbortSignal): Promise<LiveControlEpoch> {
     let lastEpoch: ControlEpoch | null = null;
     for (let attempt = 0; attempt < 2; attempt += 1) {
       let publication: DiscoveredControlPublication;
@@ -678,9 +925,10 @@ export class ControlClient {
       }
       let response: RawResponse;
       try {
-        response = await requestJson(publication, 'GET', '/v1/health', undefined, HEALTH_TIMEOUT_MS);
+        response = await requestJson(publication, 'GET', '/v1/health', undefined, HEALTH_TIMEOUT_MS, signal);
       } catch (error) {
         if (isTransportFailure(error)) {
+          if (error.aborted) throw transportReadError(error);
           if (attempt === 0) continue;
           throw transportReadError(error);
         }
@@ -696,7 +944,7 @@ export class ControlClient {
         if (attempt === 0) continue;
         throw new ControlClientError('control_api_unavailable');
       }
-      if (!this.config.supportedControlApiProtocols.includes(health.protocol) || !hasRequiredRoutes(health)) {
+      if (!this.config.supportedControlApiProtocols.includes(health.protocol) || !hasRequiredBaseRoutes(health)) {
         throw new ControlClientError('unsupported_control_api');
       }
       const live = { publication, health };
@@ -712,37 +960,84 @@ export class ControlClient {
     return (await this.establishLive()).health;
   }
 
-  async get<T = unknown>(path: string, options: ControlRequestOptions = {}): Promise<ControlHttpResponse<T>> {
-    const timeoutMs = boundedTimeout(options.timeoutMs, READ_TIMEOUT_MS);
-    const first = this.live ?? await this.establishLive();
+  supportsSemanticWait(health: ControlHealthSnapshot | null = this.live?.health ?? null): boolean {
+    return health !== null && supportsSemanticWait(health);
+  }
+
+  private async readRequest(
+    path: string,
+    timeoutMs: number | null,
+    signal: AbortSignal | undefined,
+    requireChanges: boolean,
+  ): Promise<ControlHttpResponse<unknown>> {
+    const first = this.live ?? await this.establishLive(undefined, signal);
+    if (requireChanges && !supportsSemanticWait(first.health)) throw new ControlClientError('unsupported_control_api');
     let response: RawResponse;
     try {
-      response = await requestJson(first.publication, 'GET', path, undefined, timeoutMs, options.signal);
+      response = await requestJson(first.publication, 'GET', path, undefined, timeoutMs, signal);
     } catch (error) {
       if (!isTransportFailure(error)) throw error;
       if (error.aborted || !staleReadTransport(error)) throw transportReadError(error);
       this.live = null;
-      const next = await this.establishLive(first.publication.epoch);
+      const next = await this.establishLive(first.publication.epoch, signal);
+      if (requireChanges && !supportsSemanticWait(next.health)) throw new ControlClientError('unsupported_control_api');
       try {
-        response = await requestJson(next.publication, 'GET', path, undefined, timeoutMs, options.signal);
+        response = await requestJson(next.publication, 'GET', path, undefined, timeoutMs, signal);
       } catch (retryError) {
         if (isTransportFailure(retryError)) throw transportReadError(retryError);
         throw retryError;
       }
-      return { ...response, body: response.body as T, epoch: next.publication.epoch, ambiguous: false };
+      return { ...response, epoch: next.publication.epoch, ambiguous: false };
     }
     if (response.status === 401) {
       this.live = null;
-      const next = await this.establishLive(first.publication.epoch);
+      const next = await this.establishLive(first.publication.epoch, signal);
+      if (requireChanges && !supportsSemanticWait(next.health)) throw new ControlClientError('unsupported_control_api');
       try {
-        response = await requestJson(next.publication, 'GET', path, undefined, timeoutMs, options.signal);
+        response = await requestJson(next.publication, 'GET', path, undefined, timeoutMs, signal);
       } catch (retryError) {
         if (isTransportFailure(retryError)) throw transportReadError(retryError);
         throw retryError;
       }
-      return { ...response, body: response.body as T, epoch: next.publication.epoch, ambiguous: false };
+      return { ...response, epoch: next.publication.epoch, ambiguous: false };
     }
-    return { ...response, body: response.body as T, epoch: first.publication.epoch, ambiguous: false };
+    return { ...response, epoch: first.publication.epoch, ambiguous: false };
+  }
+
+  async get<T = unknown>(path: string, options: ControlRequestOptions = {}): Promise<ControlHttpResponse<T>> {
+    const timeoutMs = boundedTimeout(options.timeoutMs, READ_TIMEOUT_MS);
+    const response = await this.readRequest(path, timeoutMs, options.signal, false);
+    return { ...response, body: response.body as T };
+  }
+
+  async snapshotChanges(options: ControlRequestOptions = {}): Promise<ControlChangesDto> {
+    const timeoutMs = boundedTimeout(options.timeoutMs, READ_TIMEOUT_MS);
+    const response = await this.readRequest(CONTROL_CHANGE_ROUTE, timeoutMs, options.signal, true);
+    if (response.status !== 200) rejectRemote(response);
+    const changes = parseDto(changesSchema, response.body);
+    if (changes.reason !== 'snapshot') throw new ControlClientError('invalid_response');
+    return changes;
+  }
+
+  async waitForChange(cursor: ControlChangeCursor, options: ControlChangeWaitOptions = {}): Promise<ControlChangesDto> {
+    const instanceId = z.string().uuid().safeParse(cursor.instanceId);
+    if (!instanceId.success) throw new ControlClientError('invalid_request');
+    const after = boundedInteger(cursor.after, 0, Number.MAX_SAFE_INTEGER);
+    const query = new URLSearchParams({ instance: instanceId.data, after: String(after) });
+    const response = await this.readRequest(
+      `${CONTROL_CHANGE_ROUTE}?${query.toString()}`,
+      boundedChangeWaitTimeout(options.timeoutMs),
+      options.signal,
+      true,
+    );
+    if (response.status === 503 && remoteCodeOf(response.body) === 'control_api_unavailable') {
+      this.live = null;
+      throw new ControlClientError('control_api_unavailable');
+    }
+    if (response.status !== 200) rejectRemote(response);
+    const changes = parseDto(changesSchema, response.body);
+    if (changes.reason === 'snapshot') throw new ControlClientError('invalid_response');
+    return changes;
   }
 
   async listSessions(options: { limit: number; cursor?: string }): Promise<ControlSessionPageDto> {
@@ -805,11 +1100,46 @@ export class ControlClient {
     return parseDto(eventsPageSchema, response.body);
   }
 
-  async post<T = unknown>(path: string, body: unknown, options: ControlRequestOptions = {}): Promise<ControlHttpResponse<T>> {
+  async readSemanticEvents(
+    sessionIdValue: string,
+    options: ControlReadEventsOptions = {},
+  ): Promise<{ events: ControlSemanticEventDto[]; total: number; nextFrom: number }> {
+    const id = sessionId(sessionIdValue);
+    if (options.from !== undefined && (options.before !== undefined || options.after !== undefined)) {
+      throw new ControlClientError('invalid_request');
+    }
+    const query = new URLSearchParams();
+    if (options.from !== undefined) query.set('from', String(boundedInteger(options.from, 0, 10_000_000)));
+    if (options.before !== undefined) query.set('before', String(boundedInteger(options.before, 1, 10_000_000)));
+    if (options.after !== undefined) query.set('after', String(boundedInteger(options.after, 0, 10_000_000)));
+    query.set('limit', String(boundedInteger(options.limit ?? 50, 1, 100)));
+    if (options.kinds !== undefined) {
+      if (options.kinds.length < 1 || options.kinds.length > 32
+          || options.kinds.some((kind) => !/^[a-z][a-z0-9_]{0,79}$/u.test(kind))) {
+        throw new ControlClientError('invalid_request');
+      }
+      query.set('kinds', options.kinds.join(','));
+    }
+    const response = await this.get(`/v1/sessions/${id}/events?${query.toString()}`);
+    if (response.status !== 200) rejectRemote(response);
+    return parseDto(semanticEventsPageSchema, response.body);
+  }
+
+  async post<T = unknown>(
+    path: string,
+    body: unknown,
+    options: ControlRequestOptions = {},
+    beforeMutation?: () => Promise<void>,
+  ): Promise<ControlHttpResponse<T>> {
     const timeoutMs = boundedTimeout(options.timeoutMs, MUTATION_TIMEOUT_MS);
     // Re-read publication and authenticate health immediately before every mutation. This makes a
     // restarted CoS process establish a fresh epoch before a POST, while the POST itself is never replayed.
-    const live = await this.establishLive();
+    const live = await this.establishLive(undefined, options.signal);
+    requireMutationCapability(live.health, path);
+    // The controller fence must run after every awaited mutation preflight. requestJson() constructs
+    // and ends the HTTP request synchronously, so there is no later async gap before the POST crosses
+    // the process boundary.
+    if (beforeMutation) await beforeMutation();
     let response: RawResponse;
     try {
       response = await requestJson(live.publication, 'POST', path, body, timeoutMs, options.signal);

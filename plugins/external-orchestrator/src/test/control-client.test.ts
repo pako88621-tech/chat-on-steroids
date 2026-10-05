@@ -6,10 +6,12 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
+  CONTROL_CHANGE_ROUTE,
   ControlClient,
   ControlClientError,
   REQUIRED_CONTROL_ACTION_ROUTES,
   REQUIRED_CONTROL_ROUTES,
+  supportsSemanticWait,
 } from '../control-client.js';
 import type { ExternalOrchestratorConfig } from '../config.js';
 import { discoverControlPublication } from '../discovery.js';
@@ -96,6 +98,8 @@ function healthBody(value: EndpointPublication, options: {
   pid?: number;
   protocol?: number;
   routes?: readonly string[];
+  omitActions?: boolean;
+  actionsEnabled?: boolean;
   actionRoutes?: readonly string[];
   actionFeatures?: readonly string[];
 } = {}): Record<string, unknown> {
@@ -103,11 +107,11 @@ function healthBody(value: EndpointPublication, options: {
     ok: true,
     protocol: options.protocol ?? value.protocol,
     routes: options.routes ?? REQUIRED_CONTROL_ROUTES,
-    actions: {
-      enabled: true,
+    ...(!options.omitActions ? { actions: {
+      enabled: options.actionsEnabled ?? true,
       routes: options.actionRoutes ?? REQUIRED_CONTROL_ACTION_ROUTES,
       features: options.actionFeatures ?? ['input_expected_conversation'],
-    },
+    } } : {}),
     pid: options.pid ?? value.pid,
     appVersion: value.appVersion,
     startedAt: value.startedAt,
@@ -229,7 +233,7 @@ test('client connects only to literal 127.0.0.1 and sends the published bearer a
   }
 });
 
-test('health fences pid, protocol, required routes/features, and unsupported publication protocol', async () => {
+test('health fences pid, protocol, base read routes, and unsupported publication protocol without requiring actions or changes', async () => {
   const fixture = await createFixture();
   const bearer = token(4);
   let published!: EndpointPublication;
@@ -251,17 +255,71 @@ test('health fences pid, protocol, required routes/features, and unsupported pub
     healthOverride = { routes: REQUIRED_CONTROL_ROUTES.filter((route) => route !== '/v1/sessions/{id}/events') };
     await assert.rejects(new ControlClient(fixture.config).health(), errorCode('unsupported_control_api', [bearer]));
 
-    healthOverride = { actionRoutes: REQUIRED_CONTROL_ACTION_ROUTES.filter((route) => route !== 'POST /v1/sessions/{id}/stop') };
-    await assert.rejects(new ControlClient(fixture.config).health(), errorCode('unsupported_control_api', [bearer]));
+    healthOverride = { actionsEnabled: false, actionRoutes: [], actionFeatures: [] };
+    const readOnly = await new ControlClient(fixture.config).health();
+    assert.equal(readOnly.actions.enabled, false);
+    assert.equal(supportsSemanticWait(readOnly), false);
 
-    healthOverride = { actionFeatures: [] };
-    await assert.rejects(new ControlClient(fixture.config).health(), errorCode('unsupported_control_api', [bearer]));
+    healthOverride = { omitActions: true };
+    const preActionCore = await new ControlClient(fixture.config).health();
+    assert.deepEqual(preActionCore.actions, { enabled: false, routes: [], features: [] });
 
     const beforeUnsupported = requests;
     published = await publish(fixture, server.port, bearer, { protocol: 2 });
     healthOverride = {};
     await assert.rejects(new ControlClient(fixture.config).health(), errorCode('unsupported_control_api', [bearer]));
     assert.equal(requests, beforeUnsupported, 'unsupported publication protocol must be rejected before HTTP');
+  } finally {
+    await server.close();
+    await destroyFixture(fixture);
+  }
+});
+
+test('mutation compatibility is checked per operation while supported old-Core actions remain usable', async () => {
+  const fixture = await createFixture();
+  const bearer = token(18);
+  let published!: EndpointPublication;
+  let actionRoutes: readonly string[] = [];
+  let actionFeatures: readonly string[] = [];
+  let posts = 0;
+  const server = await startServer((req, res) => {
+    if (req.url === '/v1/health') {
+      json(res, 200, healthBody(published, { actionRoutes, actionFeatures }));
+      return;
+    }
+    if (req.method === 'POST') {
+      posts += 1;
+      json(res, 200, { ok: true });
+      return;
+    }
+    json(res, 404, { error: 'not_found' });
+  });
+  try {
+    published = await publish(fixture, server.port, bearer);
+    const client = new ControlClient(fixture.config);
+
+    await assert.rejects(client.post('/v1/inputs', { text: 'missing' }), errorCode('unsupported_control_api', [bearer]));
+    assert.equal(posts, 0);
+
+    actionRoutes = ['POST /v1/inputs'];
+    actionFeatures = [];
+    await assert.rejects(client.post('/v1/inputs', { text: 'feature-missing' }), errorCode('unsupported_control_api', [bearer]));
+    assert.equal(posts, 0);
+
+    actionRoutes = ['POST /v1/inputs/{id}/cancel'];
+    actionFeatures = [];
+    const cancelled = await client.post('/v1/inputs/00000000-0000-4000-8000-000000000001/cancel', {});
+    assert.equal(cancelled.status, 200);
+
+    actionRoutes = ['POST /v1/sessions/{id}/stop'];
+    const stopped = await client.post('/v1/sessions/session-1234/stop', { expectedTurnId: 'turn-1' });
+    assert.equal(stopped.status, 200);
+
+    actionRoutes = ['POST /v1/inputs'];
+    actionFeatures = ['input_expected_conversation'];
+    const admitted = await client.post('/v1/inputs', { text: 'supported' });
+    assert.equal(admitted.status, 200);
+    assert.equal(posts, 3);
   } finally {
     await server.close();
     await destroyFixture(fixture);
@@ -367,6 +425,132 @@ test('GET rediscoveries once after reset and port rotation', async () => {
   }
 });
 
+test('change snapshots are capability-gated and strictly validate the bounded broker DTO', async () => {
+  const fixture = await createFixture();
+  const bearer = token(19);
+  const instanceId = '11111111-1111-4111-8111-111111111111';
+  let published!: EndpointPublication;
+  let routes: readonly string[] = REQUIRED_CONTROL_ROUTES;
+  let changeCalls = 0;
+  const server = await startServer((req, res) => {
+    if (req.url === '/v1/health') {
+      json(res, 200, healthBody(published, { routes }));
+      return;
+    }
+    if (req.url === CONTROL_CHANGE_ROUTE) {
+      changeCalls += 1;
+      json(res, 200, changeCalls === 1
+        ? { instanceId, seq: 7, reason: 'snapshot' }
+        : { instanceId, seq: 8, reason: 'snapshot', leaked: 'not-allowed' });
+      return;
+    }
+    json(res, 404, { error: 'not_found' });
+  });
+  try {
+    published = await publish(fixture, server.port, bearer);
+    const client = new ControlClient(fixture.config);
+    const oldCoreHealth = await client.health();
+    assert.equal(client.supportsSemanticWait(oldCoreHealth), false);
+    await assert.rejects(client.snapshotChanges(), errorCode('unsupported_control_api', [bearer]));
+    assert.equal(changeCalls, 0, 'old Core must not be probed for an unadvertised change route');
+
+    routes = [...REQUIRED_CONTROL_ROUTES, CONTROL_CHANGE_ROUTE];
+    const newCoreHealth = await client.health();
+    assert.equal(client.supportsSemanticWait(newCoreHealth), true);
+    assert.deepEqual(await client.snapshotChanges(), { instanceId, seq: 7, reason: 'snapshot' });
+    await assert.rejects(client.snapshotChanges(), errorCode('invalid_response', [bearer]));
+  } finally {
+    await server.close();
+    await destroyFixture(fixture);
+  }
+});
+
+test('waitForChange has no default business timeout and abort closes the held GET promptly', async () => {
+  const fixture = await createFixture();
+  const bearer = token(20);
+  const instanceId = '22222222-2222-4222-8222-222222222222';
+  let published!: EndpointPublication;
+  let seenResolve!: () => void;
+  let closedResolve!: () => void;
+  const seen = new Promise<void>((resolve) => { seenResolve = resolve; });
+  const closed = new Promise<void>((resolve) => { closedResolve = resolve; });
+  const server = await startServer((req, res) => {
+    if (req.url === '/v1/health') {
+      json(res, 200, healthBody(published, { routes: [...REQUIRED_CONTROL_ROUTES, CONTROL_CHANGE_ROUTE] }));
+      return;
+    }
+    if (req.url === `${CONTROL_CHANGE_ROUTE}?instance=${instanceId}&after=4`) {
+      seenResolve();
+      req.once('close', closedResolve);
+      return;
+    }
+    json(res, 404, { error: 'not_found' });
+  });
+  try {
+    published = await publish(fixture, server.port, bearer);
+    const client = new ControlClient(fixture.config);
+    await client.health();
+    const controller = new AbortController();
+    const waiting = client.waitForChange({ instanceId, after: 4 }, { signal: controller.signal });
+    await seen;
+    controller.abort();
+    await assert.rejects(waiting, errorCode('request_aborted', [bearer]));
+    await closed;
+  } finally {
+    await server.close();
+    await destroyFixture(fixture);
+  }
+});
+
+test('waitForChange safely rediscovers once after token rotation and preserves the broker cursor', async () => {
+  const fixture = await createFixture();
+  const oldToken = token(21);
+  const newToken = token(22);
+  const instanceId = '33333333-3333-4333-8333-333333333333';
+  let accepted = oldToken;
+  let published!: EndpointPublication;
+  let healthCalls = 0;
+  let changeCalls = 0;
+  const expectedPath = `${CONTROL_CHANGE_ROUTE}?instance=${instanceId}&after=9`;
+  const server = await startServer(async (req, res) => {
+    if (req.url === '/v1/health') {
+      healthCalls += 1;
+      assert.equal(auth(req), `Bearer ${accepted}`);
+      json(res, 200, healthBody(published, { routes: [...REQUIRED_CONTROL_ROUTES, CONTROL_CHANGE_ROUTE] }));
+      return;
+    }
+    if (req.url === expectedPath) {
+      changeCalls += 1;
+      if (changeCalls === 1) {
+        assert.equal(auth(req), `Bearer ${oldToken}`);
+        accepted = newToken;
+        published = await publish(fixture, server.port, newToken);
+        json(res, 401, { error: 'unauthorized' });
+        return;
+      }
+      assert.equal(auth(req), `Bearer ${newToken}`);
+      json(res, 200, { instanceId, seq: 10, reason: 'changed' });
+      return;
+    }
+    json(res, 404, { error: 'not_found' });
+  });
+  try {
+    published = await publish(fixture, server.port, oldToken);
+    const client = new ControlClient(fixture.config);
+    await client.health();
+    assert.deepEqual(await client.waitForChange({ instanceId, after: 9 }), {
+      instanceId,
+      seq: 10,
+      reason: 'changed',
+    });
+    assert.equal(healthCalls, 2);
+    assert.equal(changeCalls, 2);
+  } finally {
+    await server.close();
+    await destroyFixture(fixture);
+  }
+});
+
 test('POST is sent once on connection reset and is never replayed to a rotated epoch', async () => {
   const fixture = await createFixture();
   const oldToken = token(9);
@@ -405,6 +589,44 @@ test('POST is sent once on connection reset and is never replayed to a rotated e
   } finally {
     await old.close();
     await next.close();
+    await destroyFixture(fixture);
+  }
+});
+
+test('POST runs the mutation fence after live-epoch preflight and sends nothing when the fence rejects', async () => {
+  const fixture = await createFixture();
+  const bearer = token(17);
+  let published!: EndpointPublication;
+  const sequence: string[] = [];
+  let posts = 0;
+  const server = await startServer((req, res) => {
+    if (req.url === '/v1/health') {
+      sequence.push('health');
+      json(res, 200, healthBody(published));
+      return;
+    }
+    if (req.method === 'POST') {
+      posts += 1;
+      sequence.push('post');
+      json(res, 200, { ok: true });
+      return;
+    }
+    json(res, 404, { error: 'not_found' });
+  });
+  try {
+    published = await publish(fixture, server.port, bearer);
+    const client = new ControlClient(fixture.config);
+    await assert.rejects(
+      client.post('/v1/inputs', { text: 'fenced' }, {}, async () => {
+        sequence.push('fence');
+        throw new Error('controller_lost');
+      }),
+      /controller_lost/u,
+    );
+    assert.deepEqual(sequence, ['health', 'fence']);
+    assert.equal(posts, 0);
+  } finally {
+    await server.close();
     await destroyFixture(fixture);
   }
 });
@@ -587,13 +809,35 @@ test('typed list/get/inputs/events helpers use bounded canonical paths and valid
     text: { text: 'hello', chars: 5, truncated: false },
   };
   const event = { seq: 1, position: 0, time: 102, kind: 'message', source: 'assistant', message: { text: 'ok', chars: 2, truncated: false } };
+  const live = {
+    activeTurnId: 'turn-1',
+    stopPending: false,
+    automation: 'goal',
+    blocked: '',
+    canSendDirectly: true,
+    canInject: false,
+    queueAtFinish: false,
+    finishHeld: false,
+    finishWaiting: false,
+    goalWait: { reason: 'activity', until: 500 },
+    recovery: [{ kind: 'silence', deadline: 400, visibleAt: null, next: 'goal', reload: false, generating: false }],
+    job: { stage: 'opening', startedAt: 90, automatic: true, busy: true, sourceSend: 'sent', destinationSend: 'not-attempted', error: null },
+    work: { state: 'waiting', reasons: ['recovery', 'goal_wait', 'job'], nextDeadline: 400 },
+  };
   const seen: string[] = [];
+  let detailCalls = 0;
   let published!: EndpointPublication;
   const server = await startServer((req, res) => {
     seen.push(String(req.url));
     if (req.url === '/v1/health') return json(res, 200, healthBody(published));
     if (req.url === '/v1/sessions?limit=2&cursor=12.session-1234') return json(res, 200, { sessions: [session], total: 1, nextCursor: null, activeId: session.id });
-    if (req.url === '/v1/sessions/session-1234?live=1') return json(res, 200, { session, live: { activeTurnId: 'turn-1', stopPending: false, blocked: '', canSendDirectly: true, canInject: false, queueAtFinish: false } });
+    if (req.url === '/v1/sessions/session-1234?live=1') {
+      detailCalls += 1;
+      return json(res, 200, {
+        session,
+        live: detailCalls === 1 ? live : { ...live, work: { ...live.work, unexpected: true } },
+      });
+    }
     if (req.url === '/v1/inputs?limit=3&state=pending%2Csent') return json(res, 200, { inputs: [input], total: 1 });
     if (req.url === '/v1/sessions/session-1234/events?after=7&limit=4&kinds=message%2Ctool') return json(res, 200, { events: [event], total: 1, nextFrom: 8 });
     if (req.url === '/v1/sessions?limit=1') return json(res, 200, { sessions: [{ ...session, updatedAt: 'bad' }], total: 1, nextCursor: null, activeId: session.id });
@@ -606,10 +850,12 @@ test('typed list/get/inputs/events helpers use bounded canonical paths and valid
     assert.deepEqual(sessions.sessions, [session]);
     const detail = await client.getSession('session-1234', { live: true });
     assert.equal(detail?.session.id, session.id);
+    assert.deepEqual(detail?.live?.work, live.work);
     const inputs = await client.listInputs({ limit: 3, state: ['pending', 'sent'] });
     assert.deepEqual(inputs.inputs, [input]);
     const events = await client.readEvents('session-1234', { after: 7, limit: 4, kinds: ['message', 'tool'] });
     assert.deepEqual(events.events, [event]);
+    await assert.rejects(client.getSession('session-1234', { live: true }), errorCode('invalid_response', [bearer]));
     await assert.rejects(client.listSessions({ limit: 1 }), errorCode('invalid_response', [bearer]));
     assert.deepEqual(seen, [
       '/v1/health',
@@ -617,6 +863,7 @@ test('typed list/get/inputs/events helpers use bounded canonical paths and valid
       '/v1/sessions/session-1234?live=1',
       '/v1/inputs?limit=3&state=pending%2Csent',
       '/v1/sessions/session-1234/events?after=7&limit=4&kinds=message%2Ctool',
+      '/v1/sessions/session-1234?live=1',
       '/v1/sessions?limit=1',
     ]);
   } finally {

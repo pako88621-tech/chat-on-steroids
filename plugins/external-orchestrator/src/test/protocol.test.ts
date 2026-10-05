@@ -70,11 +70,33 @@ test('rejects legacy authority and passthrough fields at the protocol boundary',
 
 test('keeps wait and evidence defaults bounded', () => {
   assert.deepEqual(externalOrchestrateRequestSchema.parse({ action: 'wait' }), { action: 'wait', wait_ms: 15_000 });
+  assert.deepEqual(externalOrchestrateRequestSchema.parse({ action: 'wait', until: 'activity' }), {
+    action: 'wait', until: 'activity', wait_ms: 15_000,
+  });
   assert.equal(externalOrchestrateRequestSchema.safeParse({ action: 'wait', wait_ms: 99 }).success, false);
   assert.equal(externalOrchestrateRequestSchema.safeParse({ action: 'wait', wait_ms: 30_001 }).success, false);
   assert.deepEqual(externalEvidenceRequestSchema.parse({}), { limit: 40, level: 'summary' });
   assert.equal(externalEvidenceRequestSchema.safeParse({ limit: 0 }).success, false);
   assert.equal(externalEvidenceRequestSchema.safeParse({ limit: 101 }).success, false);
+});
+
+test('freezes semantic wait modes without turning transport leases into business polling', () => {
+  assert.deepEqual(
+    externalOrchestrateRequestSchema.parse({ action: 'wait', until: 'attention' }),
+    { action: 'wait', until: 'attention' },
+  );
+  assert.deepEqual(
+    externalOrchestrateRequestSchema.parse({ action: 'wait', until: 'terminal', transport_lease_ms: 90_000 }),
+    { action: 'wait', until: 'terminal', transport_lease_ms: 90_000 },
+  );
+  for (const value of [
+    { action: 'wait', until: 'attention', wait_ms: 15_000 },
+    { action: 'wait', until: 'terminal', wait_ms: 30_000 },
+    { action: 'wait', until: 'activity', transport_lease_ms: 90_000 },
+    { action: 'wait', transport_lease_ms: 90_000 },
+    { action: 'wait', until: 'attention', transport_lease_ms: 999 },
+    { action: 'wait', until: 'terminal', transport_lease_ms: 86_400_001 },
+  ]) assert.equal(externalOrchestrateRequestSchema.safeParse(value).success, false, JSON.stringify(value));
 });
 
 test('rejects a start request whose frozen framing would exceed the Core input ceiling', () => {

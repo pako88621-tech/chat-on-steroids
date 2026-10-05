@@ -1,6 +1,14 @@
 # Standalone MCPB release contract
 
-The portable release artifact is `chat-on-steroids-external-orchestrator-<version>.mcpb`. Version `0.1.0` targets MCPB manifest 0.3, Node.js 20 or newer, macOS, Windows and Linux, and Chat On Steroids Local Control API protocol 1.
+The portable release artifact is `chat-on-steroids-external-orchestrator-<version>.mcpb`. Version `0.2.0` targets MCPB manifest 0.3, Node.js 20 or newer, macOS, Windows and Linux, and Chat On Steroids Local Control API protocol 1. It exposes exactly `cos_orchestrate` and `cos_evidence`; it does not advertise or depend on MCP Tasks.
+
+Version `0.2.0` adds event-driven semantic wait. The normal orchestration sequence is `start`, then a foreground `wait` with `until: "attention"`; after an attention wake, steer only when useful and wait again. `until: "terminal"` waits through ordinary checkpoints for terminal work state. Both modes park on the Local Control `/v1/changes` invalidation feed and reread Core-owned work/evidence only after invalidation or an exact Core deadline. `/v1/changes` carries no work semantics of its own, and EO does not run a periodic business polling timer for semantic wait. Legacy activity wait remains available only for compatibility.
+
+`transport_lease_ms` is a host-compatibility bound on how long one semantic-wait `tools/call` may remain pending. Lease expiry returns `transport_lease_expired` and does not assert progress, inactivity, checkpoint, failure, or completion. Hosts that need bounded calls may reissue the wait with the returned cursor.
+
+Compatibility remains capability-based rather than tied to an exact CoS application version. A protocol-1 Core that predates `/v1/changes` continues to provide the reads and actions it advertises; semantic `attention`/`terminal` wait alone returns `wait_unavailable` and does not silently fall back to polling. Mutation capability checks remain per operation, and the existing deterministic request-id, exact-conversation admission fence, exact-owned-input cancel, exact-turn Stop, and no-blind-replay rules remain unchanged.
+
+The stdio release supports modern MCP `2026-07-28` and the legacy `2025-11-25` initialize path. Both protocol eras expose the same two tools and no Tasks capability. Semantic wait is a foreground MCP request whose cancellation/transport lifetime belongs to the host request; Chat On Steroids Core remains the sole authority for session state, work state, recorder evidence, input delivery, tool execution, browser ownership, and Stop.
 
 Release packaging is plugin-local. Run `node scripts/package-mcpb.mjs` to build the deterministic unsigned bundle, `node scripts/verify-mcpb.mjs` to verify its checksum/metadata/manifest, and `node scripts/verify-reproducible.mjs` to prove two fresh builds have the same SHA-256. `release/SHA256SUMS` hashes the unsigned artifact and `release/RELEASE-METADATA.json` records its portable runtime contract.
 

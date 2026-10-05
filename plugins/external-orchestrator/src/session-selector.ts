@@ -14,6 +14,15 @@ export interface SessionSelectionSummary {
 export interface SessionSelectionLive {
   activeTurnId: string | null;
   blocked: string;
+  /** Additive event-driven Core projection; absent on older protocol-1 Core. */
+  work?: {
+    state: 'active' | 'waiting' | 'settling' | 'quiescent' | 'blocked';
+    reasons: Array<
+      'active_turn' | 'tool_activity' | 'recovery' | 'goal_wait'
+      | 'finish_hold' | 'job' | 'pending_input' | 'blocked'
+    >;
+    nextDeadline: number | null;
+  };
 }
 
 export interface SessionSelectionDetail {
@@ -84,14 +93,18 @@ function projectMatches(session: SessionSelectionSummary, projectId: string | un
   return projectId === undefined || session.projectId === projectId;
 }
 
-function eligibleDetail(detail: SessionSelectionDetail | null, projectId: string | undefined): detail is SessionSelectionDetail & { live: SessionSelectionLive } {
-  if (!detail?.live) return false;
-  const { session, live } = detail;
+function eligibleSummary(session: SessionSelectionSummary, projectId: string | undefined): boolean {
   return validIdentity(session.id)
     && validIdentity(session.conversationId)
     && session.endedAt === null
     && primeOrigin(session.origin)
-    && projectMatches(session, projectId)
+    && projectMatches(session, projectId);
+}
+
+function eligibleDetail(detail: SessionSelectionDetail | null, projectId: string | undefined): detail is SessionSelectionDetail & { live: SessionSelectionLive } {
+  if (!detail?.live) return false;
+  const { session, live } = detail;
+  return eligibleSummary(session, projectId)
     && live.blocked === '';
 }
 
@@ -175,9 +188,39 @@ export class SessionSelector {
     return this.#remember(selected(selection.source, detail));
   }
 
+  /**
+   * Refresh a read-only target while preserving the exact durable local session identity. Compact &
+   * Resume may legitimately move that session from conversation A to B, so conversation identity is
+   * refreshed rather than frozen here. Core can return `live:null` when the session moves during the
+   * read transaction; retry that exact session once, but never fall through to another Prime.
+   */
+  async revalidateForRead(selection: SelectedSession, projectId?: string): Promise<SelectedSession> {
+    const sessionId = selection.session.id;
+    const expectedProjectId = projectId ?? selection.session.projectId ?? undefined;
+    const first = await this.#client.getSession(sessionId, { live: true });
+    const firstEligible = this.#eligibleExact(sessionId, first, expectedProjectId);
+    if (firstEligible) return this.#remember(selected(selection.source, firstEligible));
+
+    if (first?.live === null && first.session.id === sessionId && eligibleSummary(first.session, expectedProjectId)) {
+      const retried = await this.#client.getSession(sessionId, { live: true });
+      const retryEligible = this.#eligibleExact(sessionId, retried, expectedProjectId);
+      if (retryEligible) return this.#remember(selected(selection.source, retryEligible));
+    }
+
+    throw new SessionSelectionError('session_ineligible', 'The selected Prime session is no longer eligible for read supervision.');
+  }
+
   async #readEligible(sessionId: string, projectId: string | undefined): Promise<(SessionSelectionDetail & { live: SessionSelectionLive }) | null> {
     const detail = await this.#client.getSession(sessionId, { live: true });
-    return eligibleDetail(detail, projectId) ? detail : null;
+    return this.#eligibleExact(sessionId, detail, projectId);
+  }
+
+  #eligibleExact(
+    sessionId: string,
+    detail: SessionSelectionDetail | null,
+    projectId: string | undefined,
+  ): (SessionSelectionDetail & { live: SessionSelectionLive }) | null {
+    return detail?.session.id === sessionId && eligibleDetail(detail, projectId) ? detail : null;
   }
 
   async #fallback(firstPage: SessionSelectionPage, projectId: string | undefined): Promise<SelectedSession | null> {

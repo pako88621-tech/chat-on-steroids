@@ -12,6 +12,7 @@ export const CONTROL_API_PROTOCOL = 1;
 export const CONTROL_API_ROUTES = [
   '/v1/health',
   '/v1/status',
+  '/v1/changes',
   '/v1/sessions',
   '/v1/sessions/{id}',
   '/v1/sessions/{id}/events',
@@ -20,11 +21,25 @@ export const CONTROL_API_ROUTES = [
   '/v1/log'
 ] as const;
 
+/** Process/listener-local invalidation cursor. It carries no semantic/session payload. */
+export interface ControlApiChanges {
+  instanceId: string;
+  seq: number;
+  reason: 'snapshot' | 'changed' | 'reset';
+}
+
 /**
  * Routes that change something. They are served only while the user has also switched on
  * `controlApi.allowActions`, and are listed apart from `CONTROL_API_ROUTES` for that reason.
  */
-export const CONTROL_API_ACTION_ROUTES = ['POST /v1/inputs', 'POST /v1/inputs/{id}/cancel'] as const;
+export const CONTROL_API_ACTION_ROUTES = [
+  'POST /v1/inputs',
+  'POST /v1/inputs/{id}/cancel',
+  'POST /v1/sessions/{id}/stop'
+] as const;
+
+/** Additive action semantics callers must feature-detect before relying on them. */
+export const CONTROL_API_ACTION_FEATURES = ['input_expected_conversation'] as const;
 
 /** Written to `userData/control-api/endpoint.json` while the listener is up. */
 export interface ControlApiEndpoint {
@@ -40,7 +55,7 @@ export interface ControlApiHealth {
   protocol: number;
   routes: string[];
   /** Whether the action routes are being served right now, and which ones this build has. */
-  actions: { enabled: boolean; routes: string[] };
+  actions: { enabled: boolean; routes: string[]; features: string[] };
   pid: number;
   appVersion: string;
   /** When this app process started. */
@@ -175,6 +190,28 @@ export interface ControlApiRecovery {
   generating: boolean;
 }
 
+export type ControlApiWorkState = 'active' | 'waiting' | 'settling' | 'quiescent' | 'blocked';
+export type ControlApiWorkReason =
+  | 'active_turn'
+  | 'tool_activity'
+  | 'recovery'
+  | 'goal_wait'
+  | 'finish_hold'
+  | 'job'
+  | 'pending_input'
+  | 'blocked';
+
+/**
+ * Core-owned execution/quiescence projection. Reasons are fixed enums only: no task text,
+ * objective, plan, token, path, provider payload or other secret-bearing state belongs here.
+ */
+export interface ControlApiWork {
+  state: ControlApiWorkState;
+  reasons: ControlApiWorkReason[];
+  /** Earliest strictly-future Core-owned deadline that can change this projection. */
+  nextDeadline: number | null;
+}
+
 export interface ControlApiLive {
   /** The turn ChatGPT is running now, if the app judges it still running. */
   activeTurnId: string | null;
@@ -201,6 +238,8 @@ export interface ControlApiLive {
   /** Deadlines the app is holding for this chat: the reasons it has not acted yet. */
   recovery: ControlApiRecovery[];
   job: ControlApiJob | null;
+  /** Whether Core still sees running or owed work for this exact durable session/chat. */
+  work: ControlApiWork;
 }
 
 export interface ControlApiSessionDetail {
@@ -371,4 +410,12 @@ export interface ControlApiCancelResult {
   input: ControlApiInput;
   /** False when the row was already cancelled or failed. `input.delivery` says whether it may have been sent. */
   cancelled: boolean;
+}
+
+export interface ControlApiStopResult {
+  sessionId: string;
+  /** The exact turn identity the caller fenced the Stop request to. */
+  expectedTurnId: string;
+  /** True only after the canonical bridge owner has durably accepted the exact-turn Stop request. */
+  stopPending: boolean;
 }

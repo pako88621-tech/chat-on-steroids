@@ -637,7 +637,11 @@ async function materializeOpening(entry: InputEntry): Promise<void> {
     throw new Error('Reserved opening session belongs to another ChatGPT conversation');
   if (entry.projectId && session.projectId !== entry.projectId) await assignSessionProject(session.id, entry.projectId);
 }
-export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwner']): Promise<InputEntry> {
+export function enqueueInput(
+  raw: InputArgs,
+  finishOwner?: InputEntry['finishOwner'],
+  expectedConversationId?: string,
+): Promise<InputEntry> {
   return serial(async () => {
     const input = inputArgs.parse(raw);
     if (input.stages !== undefined && JSON.stringify([input.text, ...input.stages]).length > 12000)
@@ -646,10 +650,16 @@ export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwn
     const prior = current.find((entry) => entry.id === input.id);
     if (prior) {
       if (JSON.stringify(inputArgs.parse({ ...prior, sessionId: prior.opening ? prior.requestedSessionId ?? null : prior.sessionId, mode: prior.requestedMode ?? prior.mode })) !== JSON.stringify(input)) throw new Error('Message id already belongs to different input');
+      if (expectedConversationId !== undefined && prior.conversationId !== expectedConversationId) {
+        throw new Error('The target ChatGPT conversation changed');
+      }
       if (!terminal(prior)) await materializeOpening(prior);
       return { ...prior };
     }
     const requestedSession = input.sessionId ? await getSession(input.sessionId) : null;
+    if (expectedConversationId !== undefined && requestedSession?.conversationId !== expectedConversationId) {
+      throw new Error('The target ChatGPT conversation changed');
+    }
     // Explicit injection has its own recipient and can never spend a browser completion.
     const activity = requestedSession && input.delivery !== 'tool' && input.attachmentDelivery !== 'tool'
       ? deliveryHooks?.activity?.(requestedSession) : null;
@@ -703,6 +713,9 @@ export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwn
     }
     if (retryOpening) { entry.opening = true; entry.requestedSessionId = input.sessionId; }
     entry.conversationId = await target(entry);
+    if (expectedConversationId !== undefined && entry.conversationId !== expectedConversationId) {
+      throw new Error('The target ChatGPT conversation changed');
+    }
     if (!input.sessionId) {
       entry.opening = true;
       entry.sessionId = input.id;

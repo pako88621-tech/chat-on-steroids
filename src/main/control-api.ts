@@ -5,6 +5,7 @@ import type { AddressInfo } from 'node:net';
 import path from 'node:path';
 import {
   CONTROL_API_ACTION_ROUTES,
+  CONTROL_API_ACTION_FEATURES,
   CONTROL_API_PROTOCOL,
   CONTROL_API_ROUTES,
   type ControlApiEndpoint,
@@ -13,19 +14,30 @@ import {
 } from '../shared/control-api.js';
 import type { PluginSnapshot } from '../shared/plugins.js';
 import type { BridgeStatus, ConnectionStatus, UpdateStatus } from '../shared/types.js';
-import { bridgeStatus } from './bridge.js';
+import { onSwarmChange } from './agents.js';
+import { bridgeStatus, onBridgeChange } from './bridge.js';
 import { actionsAllowed, isActionPath, serveAction } from './control-actions.js';
+import {
+  ControlChangeBroker,
+  ControlChangeClosedError,
+  ControlChangeWaiterLimitError,
+  type ControlChangeCursor,
+} from './control-changes.js';
 import { RequestError, serveRead } from './control-reads.js';
-import { getStatus } from './connection.js';
+import { getStatus, onStatusChange } from './connection.js';
+import { onGoalChange } from './goal.js';
 import { logInfo, logWarn, redact } from './logger.js';
-import { inFlightMcpRequests, inFlightToolCalls, runningToolCalls, settlingToolCalls } from './mcp/call-context.js';
+import { inFlightMcpRequests, inFlightToolCalls, onToolStateChange, runningToolCalls, settlingToolCalls } from './mcp/call-context.js';
 import { pluginManager } from './plugins/manager.js';
+import { onInputChange } from './session/input.js';
+import { onSessionChange } from './session/recorder.js';
 import { updateStatus } from './update.js';
 import { APP_VERSION } from './version.js';
 
 /**
  * The local control API: an opt-in loopback listener for a trusted local caller. It reads by
- * default; a second switch lets it send and cancel messages through the outbox.
+ * default; a second switch lets it send/cancel messages through the outbox and request exact-turn
+ * Stop through the bridge's existing durable command owner.
  *
  * Its caller is typically an MCP server an agent launched to watch this app from outside its
  * process. It is deliberately not a fourth MCP surface: those are published through tunnels and
@@ -84,6 +96,7 @@ export function setReadDeadlineForTests(ms?: number): void {
 
 let directory: string | null = null;
 let server: http.Server | null = null;
+let changes: ControlChangeBroker | null = null;
 let shutdownRequested = false;
 let lifecycle: Promise<void> = Promise.resolve();
 const recentRequests: number[] = [];
@@ -142,8 +155,18 @@ async function startOnce(): Promise<void> {
   if (shutdownRequested || server) return;
   if (!directory) throw new Error('The control API path was not initialised.');
   const token = randomBytes(32).toString('base64url');
+  const changeBroker = new ControlChangeBroker({
+    session: listener => onSessionChange(() => listener()),
+    input: onInputChange,
+    bridge: onBridgeChange,
+    goal: onGoalChange,
+    swarm: onSwarmChange,
+    status: listener => onStatusChange(() => listener()),
+    toolState: onToolStateChange,
+  });
+  changeBroker.start();
   const onRequest = (req: http.IncomingMessage, res: http.ServerResponse): void => {
-    handle(req, res, token, instance).catch((error: Error) => {
+    handle(req, res, token, instance, changeBroker).catch((error: Error) => {
       logWarn(`control API request failed: ${redact(error.message)}`);
       if (!res.headersSent) reply(res, 500, { error: 'internal_error' });
       else res.destroy();
@@ -161,6 +184,9 @@ async function startOnce(): Promise<void> {
       instance.off('error', reject);
       resolve();
     });
+  }).catch((error) => {
+    changeBroker.close();
+    throw error;
   });
   const port = (instance.address() as AddressInfo).port;
   const endpoint: ControlApiEndpoint = {
@@ -175,23 +201,81 @@ async function startOnce(): Promise<void> {
     await writePrivate(TOKEN_FILE, `${token}\n`);
     await writePrivate(ENDPOINT_FILE, `${JSON.stringify(endpoint, null, 2)}\n`);
   } catch (error) {
+    changeBroker.close();
     await drain(instance);
     await removeFiles().catch(() => undefined);
     throw error;
   }
+  changes = changeBroker;
   server = instance;
   logInfo(`control API listening on 127.0.0.1:${port}`);
 }
 
 async function stopOnce(): Promise<void> {
   const instance = server;
+  const changeBroker = changes;
   server = null;
+  changes = null;
   recentRequests.length = 0;
   recentActions.length = 0;
+  changeBroker?.close();
   await removeFiles();
   if (!instance) return;
   await drain(instance);
   logInfo('control API stopped');
+}
+
+const CHANGE_INSTANCE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function parseChangeCursor(params: URLSearchParams): ControlChangeCursor | null {
+  if ([...params].length === 0) return null;
+  const raw: Record<string, string> = Object.create(null);
+  for (const [key, value] of params) {
+    if (Object.hasOwn(raw, key) || (key !== 'instance' && key !== 'after')) {
+      throw new RequestError(400, 'invalid_query', Object.hasOwn(raw, key) ? 'a parameter was given more than once' : 'unknown parameter');
+    }
+    raw[key] = value;
+  }
+  if (!raw.instance || raw.after === undefined || !CHANGE_INSTANCE.test(raw.instance) || !/^\d{1,16}$/.test(raw.after)) {
+    throw new RequestError(400, 'invalid_query', 'instance and after must form a valid change cursor');
+  }
+  const after = Number(raw.after);
+  if (!Number.isSafeInteger(after) || after < 0) throw new RequestError(400, 'invalid_query', 'after is not valid');
+  return { instanceId: raw.instance, after };
+}
+
+async function handleChanges(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  params: URLSearchParams,
+  broker: ControlChangeBroker,
+): Promise<void> {
+  const cursor = parseChangeCursor(params);
+  if (cursor === null) return reply(res, 200, broker.snapshot());
+
+  const abort = new AbortController();
+  const onGone = () => {
+    if (!res.writableEnded) abort.abort(new Error('control_changes_client_gone'));
+  };
+  req.once('aborted', onGone);
+  res.once('close', onGone);
+  try {
+    const state = await broker.wait(cursor, abort.signal);
+    if (!res.destroyed && !res.writableEnded) reply(res, 200, state);
+  } catch (error) {
+    if (abort.signal.aborted) return;
+    if (error instanceof ControlChangeWaiterLimitError) {
+      return reply(res, 503, { error: 'busy', detail: 'too many change waits are parked' }, { 'retry-after': '1' });
+    }
+    if (error instanceof ControlChangeClosedError) {
+      if (!res.destroyed && !res.writableEnded) reply(res, 503, { error: 'control_api_unavailable' });
+      return;
+    }
+    throw error;
+  } finally {
+    req.off('aborted', onGone);
+    res.off('close', onGone);
+  }
 }
 
 function drain(instance: http.Server): Promise<void> {
@@ -300,9 +384,18 @@ function readBody(req: http.IncomingMessage, res: http.ServerResponse): Promise<
  *
  * A caller answered 504 before its turn came is not run later: it was told nothing happened, and
  * a stale message must not be admitted after the caller has moved on. One answered 504 while it
- * was running may still finish, which is why the answer says to check the outbox first.
+ * was running may still finish, which is why the answer names the authoritative read to reconcile.
  */
-function runAction<T>(work: () => Promise<T>): Promise<T> {
+function actionReconciliationDetail(route: string): string {
+  const stop = /^\/v1\/sessions\/([0-9a-z-]{8,64})\/stop$/.exec(route);
+  if (stop) return `the action may still complete; check GET /v1/sessions/${stop[1]}?live=1 before repeating it`;
+  if (route === '/v1/inputs' || /^\/v1\/inputs\/[0-9a-f-]{36}\/cancel$/.test(route)) {
+    return 'the action may still complete; check GET /v1/inputs before repeating it';
+  }
+  return 'the action may still complete; reconcile its target state before repeating it';
+}
+
+function runAction<T>(route: string, work: () => Promise<T>): Promise<T> {
   if (pendingActions >= MAX_PENDING_ACTIONS) throw new RequestError(503, 'busy', 'too many actions are waiting; retry shortly');
   pendingActions += 1;
   let expired = false;
@@ -319,7 +412,7 @@ function runAction<T>(work: () => Promise<T>): Promise<T> {
     timer = setTimeout(() => {
       expired = true;
       reject(new RequestError(504, 'timeout', started
-        ? 'the action may still complete; check GET /v1/inputs before repeating it'
+        ? actionReconciliationDetail(route)
         : 'the action did not start and will not run; it is safe to send again'));
     }, actionDeadlineMs);
   });
@@ -342,7 +435,7 @@ async function handleAction(req: http.IncomingMessage, res: http.ServerResponse,
     }
   }
   try {
-    const answer = await runAction(async () => {
+    const answer = await runAction(route, async () => {
       // The switch can flip while a body is arriving or an earlier action runs.
       if (!actionsAllowed()) return null;
       return serveAction(req.method ?? '', route, body);
@@ -356,7 +449,13 @@ async function handleAction(req: http.IncomingMessage, res: http.ServerResponse,
   }
 }
 
-async function handle(req: http.IncomingMessage, res: http.ServerResponse, token: string, instance: http.Server): Promise<void> {
+async function handle(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  token: string,
+  instance: http.Server,
+  changeBroker: ControlChangeBroker,
+): Promise<void> {
   // Never answer a browser, not even with an error body it could learn from.
   if (req.headers.origin !== undefined) return reply(res, 403, { error: 'origin_forbidden' });
   const port = (instance.address() as AddressInfo | null)?.port;
@@ -404,13 +503,25 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse, token
       ok: true,
       protocol: CONTROL_API_PROTOCOL,
       routes: [...CONTROL_API_ROUTES],
-      actions: { enabled: actionsAllowed(), routes: [...CONTROL_API_ACTION_ROUTES] },
+      actions: {
+        enabled: actionsAllowed(),
+        routes: [...CONTROL_API_ACTION_ROUTES],
+        features: [...CONTROL_API_ACTION_FEATURES]
+      },
       pid: process.pid,
       appVersion: APP_VERSION,
       startedAt: new Date(Date.now() - uptime * 1000).toISOString(),
       uptimeSeconds: Math.round(uptime)
     };
     return reply(res, 200, body);
+  }
+  if (route === '/v1/changes') {
+    try {
+      return await handleChanges(req, res, url.searchParams, changeBroker);
+    } catch (error) {
+      if (error instanceof RequestError) return reply(res, error.status, { error: error.code, ...(error.detail ? { detail: error.detail } : {}) });
+      throw error;
+    }
   }
   try {
     const body = await withReadDeadline(() => read(route, url.searchParams));

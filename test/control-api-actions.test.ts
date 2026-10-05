@@ -13,6 +13,7 @@ import type { ToolCallRecord } from '../src/shared/session.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
 
 const gate = vi.hoisted(() => ({ actions: true, enabled: true }));
+const bridgeFault = vi.hoisted(() => ({ stopError: null as string | null, stopHold: null as Promise<void> | null }));
 
 vi.mock('electron', () => ({
   app: { on: vi.fn(), getPath: () => '', getVersion: vi.fn(() => '0.0.0'), getAppPath: () => process.cwd(), isPackaged: false },
@@ -45,7 +46,17 @@ vi.mock('../src/main/connection.js', async (importOriginal) => {
 });
 vi.mock('../src/main/bridge.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/main/bridge.js')>();
-  return { ...actual, startBridge: vi.fn(async () => true) };
+  return {
+    ...actual,
+    startBridge: vi.fn(async () => true),
+    stopSessionTurn: vi.fn(async (sessionId: string, expectedTurnId: string) => {
+      if (bridgeFault.stopHold) await bridgeFault.stopHold;
+      if (bridgeFault.stopError) throw new Error(bridgeFault.stopError);
+      // This suite owns the HTTP/action seam. The canonical Stop owner's durability, exact-turn
+      // CAS and duplicate-command dedupe are exercised in bridge.test.ts.
+      return { sessionId, activeTurnId: expectedTurnId, stopPending: true } as Awaited<ReturnType<typeof actual.stopSessionTurn>>;
+    })
+  };
 });
 vi.mock('../src/main/browser-startup.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/main/browser-startup.js')>();
@@ -56,6 +67,7 @@ const { initConfigPath } = await import('../src/main/config.js');
 const { initSecretsPath } = await import('../src/main/secrets.js');
 const { flushDurable, initDurableStore, resetDurableForTests, writeDurableNow } = await import('../src/main/durable.js');
 const { appendEvent, createSession, initSessionStore, observeSessionModel, resetSessionStoreForTests } = await import('../src/main/session/store.js');
+const readModel = await import('../src/main/session/read-model.js');
 const input = await import('../src/main/session/input.js');
 const startInput = await import('../src/main/session/start-input.js');
 const bridge = await import('../src/main/bridge.js');
@@ -196,6 +208,8 @@ beforeAll(async () => {
 beforeEach(async () => {
   gate.actions = true;
   gate.enabled = true;
+  bridgeFault.stopError = null;
+  bridgeFault.stopHold = null;
   await seed([]);
   wake().mockClear();
   controlApi.setActionLimitsForTests({});
@@ -226,6 +240,8 @@ describe('with actions switched off', () => {
         await post('/v1/inputs/00000000-0000-4000-8000-000000000001/cancel'),
         await post('/v1/inputs/ffffffff-ffff-4fff-8fff-ffffffffffff/cancel', { anything: 1 }),
         await post('/v1/inputs/not-even-an-id/cancel'),
+        await post('/v1/sessions/not-even-an-id/stop', { nonsense: true }),
+        await post('/v1/sessions/2026-01-01-deadbeef/stop', { expectedTurnId: 'turn-1' }),
         // Announces far more body than it sends, and names no content type.
         await call('POST', '/v1/inputs', { body: '{}', headers: { 'content-length': '5000000', 'content-type': '' } }),
         await call('POST', '/v1/inputs', { body: 'not json', headers: { 'content-type': 'text/plain' } })
@@ -251,7 +267,11 @@ describe('with actions switched off', () => {
     expect(refused.status).toBe(403);
     expect(refused.continued).toBe(false);
     expect((await call('GET', '/v1/inputs')).status).toBe(200);
-    expect((await call('GET', '/v1/health')).body.actions).toEqual({ enabled: false, routes: ['POST /v1/inputs', 'POST /v1/inputs/{id}/cancel'] });
+    expect((await call('GET', '/v1/health')).body.actions).toEqual({
+      enabled: false,
+      routes: ['POST /v1/inputs', 'POST /v1/inputs/{id}/cancel', 'POST /v1/sessions/{id}/stop'],
+      features: ['input_expected_conversation']
+    });
   });
 
   it('follows the switch on the next request without restarting the listener', async () => {
@@ -284,8 +304,12 @@ describe('who may call', () => {
     const get = await call('GET', '/v1/inputs/' + randomUUID() + '/cancel');
     expect(get.status).toBe(405);
     expect(get.headers.allow).toBe('POST');
+    const getStop = await call('GET', '/v1/sessions/2026-01-01-deadbeef/stop');
+    expect(getStop.status).toBe(405);
+    expect(getStop.headers.allow).toBe('POST');
     expect((await call('POST', '/v1/status', { body: '{}' })).headers.allow).toBe('GET');
     expect((await call('DELETE', '/v1/inputs/' + randomUUID() + '/cancel')).headers.allow).toBe('POST');
+    expect((await call('DELETE', '/v1/sessions/2026-01-01-deadbeef/stop')).headers.allow).toBe('POST');
   });
 });
 
@@ -443,7 +467,7 @@ describe('sending', () => {
   it('answers a repeated id with the row that exists and never sends it again', async () => {
     const body = sendBody({ text: 'Only once' });
     const first = await post('/v1/inputs', body);
-    expect(first.status).toBe(202);
+    expect(first.status, JSON.stringify(first.body)).toBe(202);
     await vi.waitFor(() => expect(wake()).toHaveBeenCalledTimes(1));
 
     const sends = vi.spyOn(startInput, 'sendDesktopInput');
@@ -481,6 +505,31 @@ describe('sending', () => {
     expect(named.status).toBe(409);
     expect(named.body.error).toBe('id_conflict');
     await seed([]);
+  });
+
+  it('fences an input to the exact expected ChatGPT conversation', async () => {
+    const mismatchId = randomUUID();
+    const mismatch = await post('/v1/inputs', {
+      id: mismatchId,
+      sessionId: chatSession,
+      text: 'Do not retarget me',
+      expectedConversationId: 'chat-other-conversation'
+    });
+    expect(mismatch.status).toBe(409);
+    expect(mismatch.body.error).toBe('conversation_changed');
+    expect((await outbox()).some((entry) => entry.id === mismatchId)).toBe(false);
+    expect(wake()).not.toHaveBeenCalled();
+
+    const exactId = randomUUID();
+    const exact = await post('/v1/inputs', {
+      id: exactId,
+      sessionId: chatSession,
+      text: 'Stay on this conversation',
+      expectedConversationId: CHAT
+    });
+    expect(exact.status).toBe(202);
+    expect(exact.body.input).toMatchObject({ id: exactId, sessionId: chatSession, conversationId: CHAT });
+    expect((await outbox()).find((entry) => entry.id === exactId)?.conversationId).toBe(CHAT);
   });
 
   it('refuses a second message while one is still awaiting delivery', async () => {
@@ -687,6 +736,141 @@ describe('sending', () => {
     const replies = await Promise.all([post('/v1/inputs', sendBody()), post('/v1/inputs', sendBody({ sessionId: second }))]);
     expect(replies.map((reply) => reply.status)).toEqual([202, 202]);
     expect(await outbox()).toHaveLength(2);
+  });
+});
+
+describe('stopping one exact active turn', () => {
+  it('forwards only the exact Prime turn, advertises the route and leaves duplicate dedupe to the canonical owner', async () => {
+    const sessionId = await makeSession('Stop exact', 'chat-stop-exact');
+    const stop = vi.mocked(bridge.stopSessionTurn);
+    const before = stop.mock.calls.length;
+
+    const first = await post('/v1/sessions/' + sessionId + '/stop', { expectedTurnId: 'turn-stop-exact' });
+    expect(first.status, JSON.stringify(first.body)).toBe(202);
+    expect(first.body).toEqual({ sessionId, expectedTurnId: 'turn-stop-exact', stopPending: true });
+    expect((await call('GET', '/v1/health')).body.actions.routes).toContain('POST /v1/sessions/{id}/stop');
+
+    const again = await post('/v1/sessions/' + sessionId + '/stop', { expectedTurnId: 'turn-stop-exact' });
+    expect(again.status).toBe(202);
+    expect(again.body.stopPending).toBe(true);
+    expect(stop.mock.calls.slice(before)).toEqual([
+      [sessionId, 'turn-stop-exact'],
+      [sessionId, 'turn-stop-exact']
+    ]);
+  });
+
+  it('refuses missing, unattached and worker/helper sessions before asking the Stop owner', async () => {
+    const stop = vi.mocked(bridge.stopSessionTurn);
+    const before = stop.mock.calls.length;
+    const missing = await post('/v1/sessions/2026-01-01-deadbeef/stop', { expectedTurnId: 'turn' });
+    expect(missing.status).toBe(404);
+    expect(missing.body.error).toBe('session_not_found');
+
+    const unattached = await makeSession('No chat for Stop', null);
+    const noChat = await post('/v1/sessions/' + unattached + '/stop', { expectedTurnId: 'turn' });
+    expect(noChat.status).toBe(409);
+    expect(noChat.body.error).toBe('no_chat');
+
+    for (const kind of ['worker', 'helper'] as const) {
+      const sessionId = await makeSession('Owned ' + kind, 'chat-stop-' + kind, { kind, fromSessionId: chatSession, agentId: kind + '-1', task: 't' });
+      const reply = await post('/v1/sessions/' + sessionId + '/stop', { expectedTurnId: 'turn' });
+      expect(reply.status).toBe(409);
+      expect(reply.body.error).toBe('session_not_controllable');
+    }
+    expect(stop.mock.calls.length).toBe(before);
+  });
+
+  it('fails closed for stale or replaced turn identity and never retargets', async () => {
+    const sessionId = await makeSession('Stop stale', 'chat-stop-stale');
+    const stop = vi.mocked(bridge.stopSessionTurn);
+    const before = stop.mock.calls.length;
+    bridgeFault.stopError = 'active_turn_changed';
+    const stale = await post('/v1/sessions/' + sessionId + '/stop', { expectedTurnId: 'wrong-turn' });
+    expect(stale.status).toBe(409);
+    expect(stale.body.error).toBe('active_turn_changed');
+
+    const replaced = await post('/v1/sessions/' + sessionId + '/stop', { expectedTurnId: 'turn-stop-one' });
+    expect(replaced.status).toBe(409);
+    expect(replaced.body.error).toBe('active_turn_changed');
+    expect(stop.mock.calls.slice(before)).toEqual([
+      [sessionId, 'wrong-turn'],
+      [sessionId, 'turn-stop-one']
+    ]);
+    expect(stop.mock.calls.slice(before).some(([, turnId]) => turnId === 'turn-stop-two')).toBe(false);
+  });
+
+  it('validates the exact body and canonical route before mutation', async () => {
+    const sessionId = await makeSession('Stop body', 'chat-stop-body');
+    const stop = vi.mocked(bridge.stopSessionTurn);
+    const before = stop.mock.calls.length;
+    for (const body of [{}, { expectedTurnId: '' }, { expectedTurnId: 'x', extra: true }, { expectedTurnId: 'x'.repeat(257) }, null]) {
+      const reply = await post('/v1/sessions/' + sessionId + '/stop', body);
+      expect(reply.status).toBe(400);
+      expect(reply.body.error).toBe('invalid_body');
+    }
+    expect((await post('/v1/sessions/UPPERCASE-ID/stop', { expectedTurnId: 'turn-stop-body' })).status).toBe(404);
+    expect((await post('/v1/sessions/' + sessionId + '/stop?x=1', { expectedTurnId: 'turn-stop-body' })).body.error).toBe('invalid_query');
+    expect(stop.mock.calls.length).toBe(before);
+  });
+
+  it('maps canonical Stop owner failures without leaking owner error text', async () => {
+    const sessionId = await makeSession('Stop failures', 'chat-stop-failures');
+    for (const [owner, status, code] of [
+      ['conversation_changed', 409, 'active_turn_changed'],
+      ['conversation_superseded', 409, 'active_turn_changed'],
+      ['stop_request_not_durable', 503, 'stop_unavailable']
+    ] as const) {
+      bridgeFault.stopError = owner;
+      const reply = await post('/v1/sessions/' + sessionId + '/stop', { expectedTurnId: 'turn-stop-failures' });
+      expect(reply.status).toBe(status);
+      expect(reply.body.error).toBe(code);
+      expect(reply.raw).not.toContain(owner);
+    }
+    bridgeFault.stopError = 'private path /Users/someone/secret';
+    const hidden = await post('/v1/sessions/' + sessionId + '/stop', { expectedTurnId: 'turn-stop-failures' });
+    expect(hidden.status).toBe(500);
+    expect(hidden.body).toEqual({ error: 'internal_error' });
+    expect(hidden.raw).not.toContain('/Users/someone/secret');
+  });
+
+  it('uses session live state, not the input outbox, to reconcile an ambiguous Stop timeout', async () => {
+    const sessionId = await makeSession('Stop timeout', 'chat-stop-timeout');
+    controlApi.setActionLimitsForTests({ deadlineMs: 75 });
+    let release!: () => void;
+    bridgeFault.stopHold = new Promise<void>((resolve) => { release = resolve; });
+    try {
+      const reply = await post('/v1/sessions/' + sessionId + '/stop', { expectedTurnId: 'turn-stop-timeout' });
+      expect(reply.status).toBe(504);
+      expect(reply.body.error).toBe('timeout');
+      expect(reply.body.detail).toContain('GET /v1/sessions/' + sessionId + '?live=1');
+      expect(reply.body.detail).not.toContain('GET /v1/inputs');
+    } finally {
+      release();
+      bridgeFault.stopHold = null;
+      controlApi.setActionLimitsForTests({});
+    }
+    await vi.waitFor(() => expect(vi.mocked(bridge.stopSessionTurn)).toHaveReturned(), { timeout: 5_000 });
+  });
+
+  it('rechecks Allow actions after the session lookup and before the Stop owner', async () => {
+    const sessionId = await makeSession('Stop gate race', 'chat-stop-gate-race');
+    const real = readModel.readSession;
+    const reads = vi.spyOn(readModel, 'readSession').mockImplementationOnce(async (id) => {
+      const session = await real(id);
+      gate.actions = false;
+      return session;
+    });
+    const stop = vi.mocked(bridge.stopSessionTurn);
+    const before = stop.mock.calls.length;
+    try {
+      const reply = await post('/v1/sessions/' + sessionId + '/stop', { expectedTurnId: 'turn-stop-race' });
+      expect(reply.status).toBe(403);
+      expect(reply.body).toEqual({ error: 'actions_disabled' });
+      expect(stop.mock.calls.length).toBe(before);
+    } finally {
+      reads.mockRestore();
+      gate.actions = true;
+    }
   });
 });
 

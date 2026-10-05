@@ -19,10 +19,13 @@ const EXPECTED_TOOLS = ['cos_orchestrate', 'cos_evidence'];
 const pkg = JSON.parse(await fs.readFile(path.join(root, 'package.json'), 'utf8'));
 const manifest = JSON.parse(await fs.readFile(path.join(root, 'manifest.json'), 'utf8'));
 const configSource = await fs.readFile(path.join(root, 'src', 'config.ts'), 'utf8');
+const versionSource = await fs.readFile(path.join(root, 'src', 'version.ts'), 'utf8');
 const protocolMatch = configSource.match(/export const CONTROL_API_PROTOCOL\s*=\s*(\d+)\s*;/u);
+const versionMatch = versionSource.match(/EXTERNAL_ORCHESTRATOR_VERSION\s*=\s*['"]([^'"]+)['"]/u);
 const controlApiProtocol = Number(protocolMatch?.[1]);
 if (
   pkg.name !== EXPECTED_PACKAGE || pkg.version !== manifest.version || manifest.name !== EXPECTED_MANIFEST ||
+  versionMatch?.[1] !== pkg.version ||
   manifest.manifest_version !== '0.3' || manifest.server?.type !== 'node' || manifest.server?.entry_point !== 'dist/stdio.js' ||
   manifest.server?.mcp_config?.command !== 'node' || JSON.stringify(manifest.server?.mcp_config?.args) !== JSON.stringify(['${__dirname}/dist/stdio.js']) ||
   JSON.stringify((manifest.tools ?? []).map(tool => tool.name)) !== JSON.stringify(EXPECTED_TOOLS) ||

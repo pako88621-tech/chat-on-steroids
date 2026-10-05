@@ -433,6 +433,65 @@ interface GoalReplyObligation {
 }
 
 const goalReplies = new Map<string, GoalReplyObligation>();
+let goalDurabilityGeneration = 0;
+const goalDurabilityPending = new Map<string, Set<number>>();
+
+/** A reply/work obligation was retired in memory but that retirement is not crash-durable yet. */
+export function goalDurabilityPendingFor(conversationId: string): boolean {
+  return (goalDurabilityPending.get(conversationId)?.size ?? 0) > 0;
+}
+
+function beginGoalDurabilityPending(conversationId: string): number {
+  const generation = ++goalDurabilityGeneration;
+  const pending = goalDurabilityPending.get(conversationId);
+  if (pending) pending.add(generation);
+  else {
+    goalDurabilityPending.set(conversationId, new Set([generation]));
+    notifyGoalChange();
+  }
+  return generation;
+}
+
+function clearGoalDurabilityPendingClaim(conversationId: string, generation: number): void {
+  const pending = goalDurabilityPending.get(conversationId);
+  if (!pending || !pending.delete(generation)) return;
+  if (pending.size === 0) {
+    goalDurabilityPending.delete(conversationId);
+    notifyGoalChange();
+  }
+}
+
+/**
+ * A successful whole-ledger write proves every retirement claim that existed when its snapshot
+ * was captured. A newer claim for the same chat survives an older write completing afterward.
+ */
+async function writeGoalRepliesNow(): Promise<void> {
+  const snapshot = snapshotGoalReplies();
+  const pending = new Map(
+    [...goalDurabilityPending].map(([conversationId, generations]) => [conversationId, [...generations]])
+  );
+  await writeDurableNow(GOAL_REPLIES_STATE, snapshot);
+  let changed = false;
+  for (const [conversationId, generations] of pending) {
+    const current = goalDurabilityPending.get(conversationId);
+    if (!current) continue;
+    for (const generation of generations) current.delete(generation);
+    if (current.size === 0) {
+      goalDurabilityPending.delete(conversationId);
+      changed = true;
+    }
+  }
+  if (changed) notifyGoalChange();
+}
+
+/** Keep synchronous Goal APIs synchronous while their obligation retirement crosses the disk barrier. */
+function commitGoalReplyRetirementSoon(): void {
+  void writeGoalRepliesNow().catch(() => {
+    // The durable layer retains/retries the failed generation. Keep the owner-side veto until a
+    // later successful Goal-replies barrier proves the current projection and can clear it.
+    persistGoalRepliesSoon();
+  });
+}
 
 /**
  * How long one reply may wait for its Goal decision, and how many chats may be waiting.
@@ -563,6 +622,14 @@ export function goalPendingReplyFor(
     : null;
 }
 
+/** Exact Core-owned expiry of this chat's automatic Goal pickup, when one is still pending. */
+export function goalPendingReplyDeadlineFor(conversationId: string, now = Date.now()): number | null {
+  const reply = goalReplies.get(conversationId);
+  if (!reply || reply.state !== 'pending') return null;
+  const deadline = reply.acceptedAt + GOAL_REPLY_TTL_MS;
+  return deadline > now ? deadline : null;
+}
+
 /**
  * Every chat that still owes one Goal decision, newest acceptance first.
  *
@@ -623,6 +690,11 @@ export async function acceptGoalReplyNow(input: {
     (goalSwitchFor(input.conversationId).mode !== 'loop' ||
       await automaticLoopHasMcpWork(input.sessionId, input.conversationId, input.silenceSourceTurnId ?? input.turnId));
   if (input.current && !input.current()) return;
+  const nextState = provisionalUpgrade ? current!.state : active ? 'pending' : 'handled';
+  const retirementGeneration =
+    before?.state === 'pending' && nextState !== 'pending'
+      ? beginGoalDurabilityPending(input.conversationId)
+      : null;
   goalReplies.set(input.conversationId, {
     conversationId: input.conversationId,
     sessionId: input.sessionId,
@@ -636,10 +708,10 @@ export async function acceptGoalReplyNow(input: {
     // stable assistant id. The later id strengthens that same row; it must not re-evaluate
     // policy or reopen a decision the page already acknowledged in the meantime.
     acceptedAt: provisionalUpgrade ? current!.acceptedAt : Date.now(),
-    state: provisionalUpgrade ? current!.state : active ? 'pending' : 'handled'
+    state: nextState
   });
   try {
-    await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+    await writeGoalRepliesNow();
   } catch (error) {
     // The rejected write is one whole revision, so the rollback is too: the row this accept
     // added and the expired rows it pruned go back together, leaving the ledger exactly as the
@@ -648,16 +720,21 @@ export async function acceptGoalReplyNow(input: {
     for (const reply of bounded) goalReplies.set(reply.conversationId, reply);
     if (before) goalReplies.set(input.conversationId, before);
     else goalReplies.delete(input.conversationId);
+    if (retirementGeneration !== null) {
+      clearGoalDurabilityPendingClaim(input.conversationId, retirementGeneration);
+    }
     persistGoalRepliesSoon();
     throw error;
   }
+  notifyGoalChange();
 }
 
-function handleGoalReply(conversationId: string, turnId?: string): void {
+function handleGoalReply(conversationId: string, turnId?: string): boolean {
   const reply = goalReplies.get(conversationId);
-  if (!reply || reply.state !== 'pending' || (turnId && reply.turnId !== turnId)) return;
+  if (!reply || reply.state !== 'pending' || (turnId && reply.turnId !== turnId)) return false;
+  beginGoalDurabilityPending(conversationId);
   reply.state = 'handled';
-  persistGoalRepliesSoon();
+  return true;
 }
 
 /** A queued user message spends the same completed/silence source as Goal.
@@ -1248,10 +1325,14 @@ export async function retryGoalBrowserHelper(sourceSessionId: string, inputId: s
  * The page acknowledges after it has typed and sent — or after it has decided it cannot —
  * and both are the same fact here: this draft is spent.
  */
-export function ackGoalDraft(conversationId: string, token: string, clientId?: string): boolean {
+function acknowledgeGoalDraft(
+  conversationId: string,
+  token: string,
+  clientId?: string
+): { acknowledged: boolean; retiredReply: boolean } {
   const draft = drafts.get(conversationId);
-  if (!draft || draft.token !== token) return false;
-  if (clientId !== undefined && draft.clientId !== clientId) return false;
+  if (!draft || draft.token !== token) return { acknowledged: false, retiredReply: false };
+  if (clientId !== undefined && draft.clientId !== clientId) return { acknowledged: false, retiredReply: false };
   draft.acknowledged = true;
   // An acknowledgement can also mean "this draft will never be sent" (Goal Mode was switched
   // off, the chat moved on, or the composer stayed occupied). Do not keep spending the user's
@@ -1265,9 +1346,18 @@ export function ackGoalDraft(conversationId: string, token: string, clientId?: s
   // stream, a rejected key, an exhausted balance, an abort — and a failure to answer may not
   // be recorded as an answer. Retiring the row on `auth_rejected` meant the user fixing their
   // key found the turn it was owed for silently gone.
-  if (draft.stage === 'ready' || draft.stage === 'no-reply') handleGoalReply(conversationId, draft.turnId);
+  const retiredReply =
+    draft.stage === 'ready' || draft.stage === 'no-reply'
+      ? handleGoalReply(conversationId, draft.turnId)
+      : false;
   notifyGoalChange();
-  return true;
+  return { acknowledged: true, retiredReply };
+}
+
+export function ackGoalDraft(conversationId: string, token: string, clientId?: string): boolean {
+  const result = acknowledgeGoalDraft(conversationId, token, clientId);
+  if (result.retiredReply) commitGoalReplyRetirementSoon();
+  return result.acknowledged;
 }
 
 /** The browser ACK is not successful until the reply tombstone is crash-durable. */
@@ -1276,9 +1366,9 @@ export async function ackGoalDraftNow(
   token: string,
   clientId?: string
 ): Promise<boolean> {
-  const acknowledged = ackGoalDraft(conversationId, token, clientId);
-  if (acknowledged) await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
-  return acknowledged;
+  const result = acknowledgeGoalDraft(conversationId, token, clientId);
+  if (result.acknowledged) await writeGoalRepliesNow();
+  return result.acknowledged;
 }
 
 /**
@@ -1300,8 +1390,16 @@ export function retireGoalDrafts(retireReplies = false): number {
   // Removing the attempt permits that same source to use the corrected settings.
   drafts.clear();
   if (retireReplies) {
-    for (const reply of goalReplies.values()) reply.state = 'handled';
-    if (goalReplies.size > 0) persistGoalRepliesSoon();
+    let retiredReply = false;
+    for (const reply of goalReplies.values()) {
+      if (reply.state === 'pending') {
+        beginGoalDurabilityPending(reply.conversationId);
+        reply.state = 'handled';
+        retiredReply = true;
+      }
+    }
+    if (retiredReply) commitGoalReplyRetirementSoon();
+    else if (goalReplies.size > 0) persistGoalRepliesSoon();
   }
   return retired;
 }
@@ -1317,7 +1415,7 @@ export function retireGoalDraftsFor(conversationId: string): boolean {
   const draft = drafts.get(conversationId);
   const pending = goalReplies.get(conversationId)?.state === 'pending';
   if (!draft || draft.acknowledged) {
-    if (pending) handleGoalReply(conversationId);
+    if (pending && handleGoalReply(conversationId)) commitGoalReplyRetirementSoon();
     return pending;
   }
   draft.acknowledged = true;
@@ -1325,7 +1423,7 @@ export function retireGoalDraftsFor(conversationId: string): boolean {
   if (draft.settledAt === 0) draft.settledAt = Date.now();
   draft.text = '';
   draft.reply = '';
-  handleGoalReply(conversationId);
+  if (handleGoalReply(conversationId)) commitGoalReplyRetirementSoon();
   notifyGoalChange();
   return true;
 }
@@ -1385,6 +1483,10 @@ export async function setGoalReplyActiveNow(conversationId: string, active: bool
   if (!before) return Boolean(draft);
 
   const previous = { ...before };
+  const retirementGeneration =
+    !active && before.state === 'pending'
+      ? beginGoalDurabilityPending(conversationId)
+      : null;
   before.state = active ? 'pending' : 'handled';
   // A deliberate On is a new pickup episode for the same stable final reply. It gets the
   // recovery schedule from now, not from when that answer happened under an Off switch.
@@ -1392,15 +1494,24 @@ export async function setGoalReplyActiveNow(conversationId: string, active: bool
   if (active) before.explicitActivation = true;
   const acceptedAt = before.acceptedAt;
   try {
-    await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+    await writeGoalRepliesNow();
   } catch (error) {
-    if (goalReplies.get(conversationId) === before && before.acceptedAt === acceptedAt) goalReplies.set(conversationId, previous);
+    const rolledBack =
+      goalReplies.get(conversationId) === before && before.acceptedAt === acceptedAt;
+    if (rolledBack) {
+      goalReplies.set(conversationId, previous);
+      if (retirementGeneration !== null) {
+        clearGoalDurabilityPendingClaim(conversationId, retirementGeneration);
+      }
+    }
     persistGoalRepliesSoon();
     throw error;
   }
+  if (active) notifyGoalChange();
   if (active && !stillCurrent() && goalReplies.get(conversationId) === before && before.acceptedAt === acceptedAt) {
+    beginGoalDurabilityPending(conversationId);
     before.state = 'handled';
-    await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+    await writeGoalRepliesNow();
     return false;
   }
   return true;
@@ -1415,7 +1526,7 @@ export async function withdrawSilenceGoalReplyNow(conversationId: string, replyI
   if (goalReplies.get(conversationId) !== reply) return;
   goalReplies.delete(conversationId);
   try {
-    await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+    await writeGoalRepliesNow();
   } catch (error) {
     // This is revocation of fabricated authority, not a retryable final obligation.
     // Keep it absent in memory; a restart also rejects legacy rows without source proof.
@@ -1445,7 +1556,7 @@ export async function deferSilenceGoalReplyNow(conversationId: string, turnId: s
   if ((reply.listenUntil ?? 0) >= deadline) return true;
   reply.listenUntil = deadline;
   notifyGoalChange();
-  try { await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies()); }
+  try { await writeGoalRepliesNow(); }
   catch (error) { persistGoalRepliesSoon(); throw error; }
   return goalReplies.get(conversationId) === reply;
 }
@@ -1456,7 +1567,7 @@ export async function claimGoalRecoveryStopNow(conversationId: string, replyId: 
   if (!reply || reply.replyId !== replyId || reply.acceptedAt !== acceptedAt || reply.state !== 'pending' || !goalArmedFor(conversationId) ||
       !reply.listenUntil || reply.listenUntil > Date.now() || reply.recoveryStopClaimed) return false;
   reply.recoveryStopClaimed = true;
-  await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+  await writeGoalRepliesNow();
   return goalReplies.get(conversationId) === reply && reply.state === 'pending' && goalArmedFor(conversationId);
 }
 
@@ -1468,6 +1579,8 @@ export function resetGoalStateForTests(): void {
   pendingGoalSwitches.clear();
   drafts.clear();
   goalReplies.clear();
+  goalDurabilityPending.clear();
+  goalDurabilityGeneration = 0;
   goalObjectives.clear();
   goalSwitches.clear();
   goalSwitchWrites = Promise.resolve();

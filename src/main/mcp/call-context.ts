@@ -144,7 +144,37 @@ export function runInCallContext<T>(context: CallContext, fn: () => T): T {
  */
 const running = new Set<CallContext>();
 const settling = new Set<CallContext>();
+const toolStateListeners = new Set<() => void>();
 let inFlightRequests = 0;
+
+/**
+ * Observes only running/settling set visibility used by per-conversation work projections.
+ * Notifications happen after each set mutation so a listener that re-reads here sees the new
+ * state. Listener failures cannot interfere with the tool call whose state just changed.
+ */
+export function onToolStateChange(listener: () => void): () => void {
+  toolStateListeners.add(listener);
+  return () => toolStateListeners.delete(listener);
+}
+
+function notifyToolStateChange(): void {
+  for (const listener of [...toolStateListeners]) {
+    try { listener(); } catch { /* observers do not own tool-call lifetime */ }
+  }
+}
+
+/**
+ * Publishes a newly proven conversation owner for one live/settling call.
+ *
+ * Ownership changes the per-conversation work projection just as much as entering/leaving the
+ * running/settling sets. Keep the mutation behind this helper so the change broker can use
+ * onToolStateChange as a complete invalidation fence for tool_activity.
+ */
+export function setCallConversationId(context: CallContext, conversationId: string | null): void {
+  if (context.caller.conversationId === conversationId) return;
+  context.caller.conversationId = conversationId;
+  if (running.has(context) || settling.has(context)) notifyToolStateChange();
+}
 
 function countFor(calls: Iterable<CallContext>, conversationId: string | null): number {
   let count = 0;
@@ -222,9 +252,10 @@ export function inFlightToolCalls(conversationId: string | null = null): number 
  */
 export function holdWhileSettling(context: CallContext, work: Promise<unknown>): void {
   settling.add(context);
+  notifyToolStateChange();
   void work.then(
-    () => settling.delete(context),
-    () => settling.delete(context)
+    () => { if (settling.delete(context)) notifyToolStateChange(); },
+    () => { if (settling.delete(context)) notifyToolStateChange(); }
   );
 }
 
@@ -255,10 +286,11 @@ export async function trackMcpRequest<T>(fn: () => Promise<T>): Promise<T> {
  */
 export async function trackInFlight<T>(context: CallContext, fn: () => Promise<T>): Promise<T> {
   running.add(context);
+  notifyToolStateChange();
   try {
     return await fn();
   } finally {
-    running.delete(context);
+    if (running.delete(context)) notifyToolStateChange();
   }
 }
 

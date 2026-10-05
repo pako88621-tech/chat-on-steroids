@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createMcpHandler } from '@modelcontextprotocol/server';
+import { createMcpHandler, InMemoryTransport } from '@modelcontextprotocol/server';
 import { createExternalOrchestratorMcpServer, type ExternalOrchestratorBackend } from '../server.js';
 
 async function rpc(handler: ReturnType<typeof createMcpHandler>, method: string, params: Record<string, unknown> = {}) {
@@ -55,6 +55,20 @@ test('lists exactly two strict public tools', async () => {
   } finally { await handler.close(); }
 });
 
+test('modern discovery publishes only tools plus generic orchestration instructions', async () => {
+  const handler = createMcpHandler(() => createExternalOrchestratorMcpServer(backend([])));
+  try {
+    const discovered = await rpc(handler, 'server/discover');
+    assert.deepEqual(Object.keys(discovered.result.capabilities), ['tools']);
+    assert.equal('resources' in discovered.result.capabilities, false);
+    assert.equal('prompts' in discovered.result.capabilities, false);
+    assert.equal('tasks' in discovered.result.capabilities, false);
+    assert.match(discovered.result.instructions, /request_id/);
+    assert.match(discovered.result.instructions, /until 'attention'/);
+    assert.match(discovered.result.instructions, /ambiguous/);
+  } finally { await handler.close(); }
+});
+
 test('dispatches hardened defaults and separate stop without client authority context', async () => {
   const calls: unknown[] = [];
   const handler = createMcpHandler(() => createExternalOrchestratorMcpServer(backend(calls)));
@@ -87,4 +101,82 @@ test('rejects missing request ownership and legacy fields before backend dispatc
     assert.equal(unknown.result, undefined);
     assert.equal(typeof unknown.error?.message, 'string');
   } finally { await handler.close(); }
+});
+
+test('MCP cancellation aborts the exact in-flight backend request and suppresses its response', async () => {
+  let markStarted!: () => void;
+  let markAborted!: () => void;
+  const started = new Promise<void>(resolve => { markStarted = resolve; });
+  const aborted = new Promise<void>(resolve => { markAborted = resolve; });
+  const calls: unknown[] = [];
+  const customBackend = backend(calls);
+  customBackend.orchestrate = async (request, signal) => {
+    calls.push(request);
+    markStarted();
+    return await new Promise((_, reject) => {
+      const onAbort = () => {
+        markAborted();
+        reject(signal?.reason ?? new Error('aborted'));
+      };
+      if (signal?.aborted) onAbort();
+      else signal?.addEventListener('abort', onAbort, { once: true });
+    });
+  };
+
+  const server = createExternalOrchestratorMcpServer(customBackend);
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const messages: unknown[] = [];
+  const hasResponse = (id: string | number) => messages.some(message => (
+    typeof message === 'object' && message !== null && 'id' in message
+    && (message as { id?: string | number }).id === id
+  ));
+  clientTransport.onmessage = message => { messages.push(message); };
+  await clientTransport.start();
+  await server.connect(serverTransport);
+
+  try {
+    await clientTransport.send({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {
+        protocolVersion: '2025-11-25',
+        capabilities: {},
+        clientInfo: { name: 'eo-cancellation-contract', version: '1.0.0' },
+      },
+    });
+    await new Promise<void>((resolve, reject) => {
+      const deadline = setTimeout(() => reject(new Error('initialize response timed out')), 1_000);
+      const poll = () => {
+        if (hasResponse(1)) {
+          clearTimeout(deadline);
+          resolve();
+        } else {
+          setImmediate(poll);
+        }
+      };
+      poll();
+    });
+    await clientTransport.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+
+    await clientTransport.send({
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tools/call',
+      params: { name: 'cos_orchestrate', arguments: { action: 'status' } },
+    });
+    await started;
+    await clientTransport.send({
+      jsonrpc: '2.0',
+      method: 'notifications/cancelled',
+      params: { requestId: 2, reason: 'test cancellation' },
+    });
+    await aborted;
+    await new Promise(resolve => setTimeout(resolve, 25));
+    assert.equal(hasResponse(2), false);
+    assert.deepEqual(calls, [{ action: 'status' }]);
+  } finally {
+    await clientTransport.close();
+    await server.close();
+  }
 });

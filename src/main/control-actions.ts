@@ -1,5 +1,6 @@
 import { z } from 'zod';
-import type { ControlApiCancelResult, ControlApiSendResult } from '../shared/control-api.js';
+import type { ControlApiCancelResult, ControlApiSendResult, ControlApiStopResult } from '../shared/control-api.js';
+import { stopSessionTurn } from './bridge.js';
 import { getConfig } from './config.js';
 import { projectInput, RequestError } from './control-reads.js';
 import { logInfo } from './logger.js';
@@ -9,8 +10,8 @@ import { readSession } from './session/read-model.js';
 import { cancelDesktopInput, sendDesktopInput } from './session/start-input.js';
 
 /**
- * The action routes of the local control API: send a message to an existing chat, and cancel
- * one that has not been handed over.
+ * The action routes of the local control API: send a message to an existing chat, cancel one
+ * that has not been handed over, or request Stop for one exact active turn.
  *
  * There is no new send path. A message goes through `sendDesktopInput`, the same entry the
  * composer uses, and is cancelled through `cancelDesktopInput`; the outbox stays the only owner
@@ -40,18 +41,22 @@ const sendBody = z
     id: lowerUuid,
     sessionId: z.string().regex(/^[0-9a-z-]{8,64}$/),
     text: z.string().max(MAX_TEXT).refine((value) => value.trim().length > 0, 'text is empty'),
+    /** Optional CAS fence: this exact session must still name this exact ChatGPT conversation. */
+    expectedConversationId: z.string().min(1).max(256).optional(),
     // Consent to a send that would stop the answer ChatGPT is writing right now.
     interrupt: z.boolean().optional()
   })
   .strict();
 
 const cancelBody = z.object({}).strict();
+const stopBody = z.object({ expectedTurnId: z.string().min(1).max(256) }).strict();
 
 const CANCEL_ROUTE = /^\/v1\/inputs\/([0-9a-f-]{36})\/cancel$/;
+const STOP_ROUTE = /^\/v1\/sessions\/([0-9a-z-]{8,64})\/stop$/;
 
 /** Every path an action can arrive on, whatever the id, so one gate can refuse them all alike. */
 export function isActionPath(route: string): boolean {
-  return route === '/v1/inputs' || /^\/v1\/inputs\/[^/]+\/cancel$/.test(route);
+  return route === '/v1/inputs' || /^\/v1\/inputs\/[^/]+\/cancel$/.test(route) || /^\/v1\/sessions\/[^/]+\/stop$/.test(route);
 }
 
 export interface ActionReply {
@@ -100,7 +105,8 @@ async function send(rawBody: unknown): Promise<ActionReply> {
   // compares the whole request, `dueAt` included, and a retry a moment later would not match.
   const existing = await find(body.id);
   if (existing) {
-    if (existing.purpose === 'decision' || existing.sessionId !== body.sessionId || existing.text !== text) {
+    if (existing.purpose === 'decision' || existing.sessionId !== body.sessionId || existing.text !== text
+        || (body.expectedConversationId !== undefined && existing.conversationId !== body.expectedConversationId)) {
       throw new RequestError(409, 'id_conflict', 'this id belongs to a different message');
     }
     const replay: ControlApiSendResult = { input: projectInput(existing), replayed: true };
@@ -111,6 +117,9 @@ async function send(rawBody: unknown): Promise<ActionReply> {
   if (!session) throw new RequestError(404, 'session_not_found');
   await controllable(body.sessionId);
   if (!session.conversationId) throw new RequestError(409, 'no_chat', 'this session has no ChatGPT chat to send to');
+  if (body.expectedConversationId !== undefined && session.conversationId !== body.expectedConversationId) {
+    throw new RequestError(409, 'conversation_changed', 'the session moved to another ChatGPT conversation');
+  }
 
   // A send to a tool-free turn stops the answer being written, then sends. That is a decision
   // for the caller, not a default.
@@ -133,8 +142,11 @@ async function send(rawBody: unknown): Promise<ActionReply> {
   if (!actionsAllowed()) throw new RequestError(403, 'actions_disabled');
   let row: InputEntry;
   try {
-    row = await sendDesktopInput(input);
+    row = await sendDesktopInput(input, { expectedConversationId: body.expectedConversationId });
   } catch (error) {
+    if (error instanceof Error && error.message === 'The target ChatGPT conversation changed') {
+      throw new RequestError(409, 'conversation_changed');
+    }
     throw refusal(error) ?? error;
   }
   // The outbox decides for itself, when it admits the row, whether this send stops an answer. If
@@ -192,11 +204,49 @@ async function cancel(id: string, rawBody: unknown): Promise<ActionReply> {
   return { status: 200, body: done };
 }
 
+function stopRefusal(error: unknown): RequestError | null {
+  const message = error instanceof Error ? error.message : '';
+  // `no_chat` was already checked from the session read above. Reaching the owner with a now
+  // unattached/superseded conversation is a race: the exact target changed under the request.
+  if (message === 'session_not_recorded' || message === 'active_turn_changed' || message === 'conversation_changed' || message === 'conversation_superseded') {
+    return new RequestError(409, 'active_turn_changed');
+  }
+  if (message === 'stop_request_not_durable') return new RequestError(503, 'stop_unavailable');
+  return null;
+}
+
+async function stop(sessionId: string, rawBody: unknown): Promise<ActionReply> {
+  const body = parse(stopBody, rawBody);
+  const session = await readSession(sessionId);
+  if (!session) throw new RequestError(404, 'session_not_found');
+  await controllable(sessionId);
+  if (!session.conversationId) throw new RequestError(409, 'no_chat');
+  // The switch can flip while the lookups above run. Stop is a mutation too, so fence it at the
+  // last point before the canonical bridge owner just like send() fences the outbox handoff.
+  if (!actionsAllowed()) throw new RequestError(403, 'actions_disabled');
+
+  let controls;
+  try {
+    controls = await stopSessionTurn(sessionId, body.expectedTurnId);
+  } catch (error) {
+    throw stopRefusal(error) ?? error;
+  }
+  const reply: ControlApiStopResult = {
+    sessionId,
+    expectedTurnId: body.expectedTurnId,
+    stopPending: controls.stopPending === true
+  };
+  logInfo('control API: Stop admitted for session ' + sessionId + ', turn ' + body.expectedTurnId);
+  return { status: 202, body: reply };
+}
+
 /** Undefined when the method and path are not an action. */
 export async function serveAction(method: string, route: string, body: unknown): Promise<ActionReply | undefined> {
   if (method !== 'POST') return undefined;
   if (route === '/v1/inputs') return send(body);
   const match = CANCEL_ROUTE.exec(route);
   if (match) return cancel(match[1]!, body);
+  const stopMatch = STOP_ROUTE.exec(route);
+  if (stopMatch) return stop(stopMatch[1]!, body);
   return undefined;
 }

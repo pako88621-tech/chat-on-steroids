@@ -46,6 +46,7 @@ class FakeSelectionClient implements SessionSelectionClient {
   readonly details = new Map<string, SessionSelectionDetail | null>();
   readonly pages = new Map<string, SessionSelectionPage>();
   firstPage: SessionSelectionPage = page([]);
+  getSessionOverride: ((sessionId: string) => Promise<SessionSelectionDetail | null> | SessionSelectionDetail | null) | null = null;
 
   async listSessions(options: { limit: number; cursor?: string }): Promise<SessionSelectionPage> {
     this.listCalls.push({ ...options });
@@ -57,6 +58,7 @@ class FakeSelectionClient implements SessionSelectionClient {
 
   async getSession(sessionId: string, _options: { live: true }): Promise<SessionSelectionDetail | null> {
     this.getCalls.push(sessionId);
+    if (this.getSessionOverride) return this.getSessionOverride(sessionId);
     return this.details.get(sessionId) ?? null;
   }
 }
@@ -214,4 +216,97 @@ test('mutation revalidation rejects compaction/supersession and other eligibilit
     client.details.set('prime', replacement);
     await expectSelectionError(selector.revalidateForMutation(selected, 'project-a'), 'session_ineligible');
   }
+});
+
+test('read revalidation follows the same durable session across Compact & Resume without selecting another Prime', async () => {
+  const client = new FakeSelectionClient();
+  client.details.set('prime', detail('prime', { conversationId: 'conversation-a', updatedAt: 100 }));
+  client.details.set('other-prime', detail('other-prime', { conversationId: 'conversation-other', updatedAt: 999 }));
+  client.firstPage = page([summary('other-prime')], { activeId: 'other-prime' });
+  const selector = new SessionSelector(client);
+  const selected = await selector.select({ sessionId: 'prime', projectId: 'project-a' });
+
+  client.details.set('prime', detail(
+    'prime',
+    { conversationId: 'conversation-b', updatedAt: 200 },
+    { activeTurnId: 'turn-b', blocked: '' },
+  ));
+
+  const revalidated = await selector.revalidateForRead(selected, 'project-a');
+  assert.equal(revalidated.session.id, 'prime');
+  assert.equal(revalidated.conversationId, 'conversation-b');
+  assert.equal(revalidated.session.updatedAt, 200);
+  assert.equal(revalidated.live.activeTurnId, 'turn-b');
+  assert.equal(selector.selectedSessionId, 'prime');
+  assert.equal(client.listCalls.length, 0, 'read revalidation must never consult active/fallback Prime selection');
+  await expectSelectionError(selector.revalidateForMutation(selected, 'project-a'), 'session_ineligible');
+});
+
+test('read revalidation retries the exact session once when compaction moves during the live read', async () => {
+  const client = new FakeSelectionClient();
+  client.details.set('prime', detail('prime', { conversationId: 'conversation-a' }));
+  const selector = new SessionSelector(client);
+  const selected = await selector.select({ sessionId: 'prime', projectId: 'project-a' });
+  const snapshots = [
+    detail('prime', { conversationId: 'conversation-b', updatedAt: 200 }, null),
+    detail('prime', { conversationId: 'conversation-b', updatedAt: 201 }, { activeTurnId: 'turn-b', blocked: '' }),
+  ];
+  client.getSessionOverride = sessionId => {
+    assert.equal(sessionId, 'prime');
+    return snapshots.shift() ?? null;
+  };
+
+  const revalidated = await selector.revalidateForRead(selected, 'project-a');
+  assert.equal(revalidated.session.id, 'prime');
+  assert.equal(revalidated.conversationId, 'conversation-b');
+  assert.equal(revalidated.session.updatedAt, 201);
+  assert.deepEqual(client.getCalls.slice(-2), ['prime', 'prime']);
+  assert.equal(client.listCalls.length, 0);
+});
+
+test('read revalidation rejects ineligible, superseded and wrong-session snapshots without fallback', async () => {
+  const cases: Array<[string, SessionSelectionDetail | null, string | undefined]> = [
+    ['worker', detail('prime', { origin: { kind: 'worker' } }), 'project-a'],
+    ['helper', detail('prime', { origin: { kind: 'helper' } }), 'project-a'],
+    ['ended', detail('prime', { endedAt: 1 }), 'project-a'],
+    ['no-conversation', detail('prime', { conversationId: null }), 'project-a'],
+    ['blocked', detail('prime', {}, { activeTurnId: null, blocked: 'blocked' }), 'project-a'],
+    ['superseded', detail('prime', { conversationId: 'conversation-b' }, null), 'project-a'],
+    ['project-mismatch', detail('prime', { projectId: 'project-b' }), undefined],
+    ['wrong-session', detail('other-prime'), 'project-a'],
+    ['missing', null, 'project-a'],
+  ];
+
+  for (const [name, replacement, projectId] of cases) {
+    const client = new FakeSelectionClient();
+    client.details.set('prime', detail('prime', { conversationId: 'conversation-a' }));
+    client.details.set('other-prime', detail('other-prime'));
+    client.firstPage = page([summary('other-prime')], { activeId: 'other-prime' });
+    const selector = new SessionSelector(client);
+    const selected = await selector.select({ sessionId: 'prime', projectId: 'project-a' });
+    client.details.set('prime', replacement);
+
+    await expectSelectionError(selector.revalidateForRead(selected, projectId), 'session_ineligible');
+    assert.equal(selector.selectedSessionId, 'prime', `${name} must not retarget the remembered durable session`);
+    assert.equal(client.listCalls.length, 0, `${name} must not consult another Prime`);
+  }
+});
+
+test('read revalidation propagates stale read errors, including after a compaction-race retry', async () => {
+  const client = new FakeSelectionClient();
+  client.details.set('prime', detail('prime', { conversationId: 'conversation-a' }));
+  const selector = new SessionSelector(client);
+  const selected = await selector.select({ sessionId: 'prime', projectId: 'project-a' });
+  const stale = new Error('stale control read');
+  let reads = 0;
+  client.getSessionOverride = () => {
+    reads += 1;
+    if (reads === 1) return detail('prime', { conversationId: 'conversation-b' }, null);
+    throw stale;
+  };
+
+  await assert.rejects(selector.revalidateForRead(selected, 'project-a'), error => error === stale);
+  assert.equal(reads, 2);
+  assert.equal(selector.selectedSessionId, 'prime');
+  assert.equal(client.listCalls.length, 0);
 });
