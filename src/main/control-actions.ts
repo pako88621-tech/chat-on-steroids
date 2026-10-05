@@ -189,6 +189,9 @@ async function cancel(id: string, rawBody: unknown): Promise<ActionReply> {
     return notCancellable(row, 'it is paired with another message; cancel it in the app');
   }
 
+  // The switch can flip while ownership and pairing are revalidated above. Cancel is a mutation
+  // too, so fence it at the last synchronous point before handing authority to the outbox owner.
+  if (!actionsAllowed()) throw new RequestError(403, 'actions_disabled');
   await cancelDesktopInput(id);
   const after = await find(id);
   if (!after) throw new RequestError(409, 'not_cancellable', 'the message left the outbox while it was being cancelled');

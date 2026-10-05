@@ -16,6 +16,7 @@ function subscriptions(): ControlChangeSubscriptions {
   const subscribe = () => () => {};
   return {
     session: subscribe,
+    blocked: subscribe,
     input: subscribe,
     bridge: subscribe,
     goal: subscribe,

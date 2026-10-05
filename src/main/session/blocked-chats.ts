@@ -46,6 +46,7 @@ const BLOCKED_STATE_VERSION = 1;
 /** Conversation id -> when the user blocked it. */
 const blocked = new Map<string, number>();
 let restored = false;
+const listeners = new Set<() => void>();
 
 interface PersistedBlocks {
   version: number;
@@ -121,6 +122,12 @@ export function chatBlockedAt(conversationId: string): number | null {
   return blocked.get(conversationId) ?? null;
 }
 
+/** Invalidates projections whose work/block state depends on the exact blocked-chat owner. */
+export function onBlockedChatChange(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => { listeners.delete(listener); };
+}
+
 /**
  * Blocks or releases one conversation. Idempotent in both directions: the user pressing the
  * button twice must not move a block's timestamp or resurrect a released one.
@@ -137,6 +144,7 @@ export function setChatBlocked(conversationId: string, next: boolean): void {
     blocked.delete(conversationId);
   }
   writeDurableSoon(BLOCKED_STATE, snapshot());
+  for (const listener of [...listeners]) listener();
 }
 
 export function resetBlockedChatsForTests(): void {

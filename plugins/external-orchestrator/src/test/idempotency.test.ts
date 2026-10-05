@@ -404,15 +404,18 @@ test('POSIX state, lock, owner, and ledger permissions remain private', { skip: 
     });
     try {
       await reserve(controller, 'req.modes.1', { value: 1 });
-      const [stateStat, lockStat, ownerStat, ledgerStat] = await Promise.all([
+      const owner = await readOwner(controller.controllerLockPath);
+      const [stateStat, lockStat, ownerStat, heartbeatStat, ledgerStat] = await Promise.all([
         fs.stat(controller.stateDir),
         fs.stat(controller.controllerLockPath),
         fs.stat(path.join(controller.controllerLockPath, 'owner.json')),
+        fs.stat(path.join(controller.controllerLockPath, `heartbeat-${owner.nonce}.json`)),
         fs.stat(controller.ledgerFile),
       ]);
       assert.equal(stateStat.mode & 0o777, 0o700);
       assert.equal(lockStat.mode & 0o777, 0o700);
       assert.equal(ownerStat.mode & 0o777, 0o600);
+      assert.equal(heartbeatStat.mode & 0o777, 0o600);
       assert.equal(ledgerStat.mode & 0o777, 0o600);
     } finally {
       await controller.release();
@@ -489,6 +492,134 @@ test('an old lock nonce cannot release or replace its successor', async () => {
     } finally {
       await oldController.release();
       await successor.release();
+    }
+  });
+});
+
+test('an in-flight stale refresh cannot overwrite the successor lock generation', async () => {
+  await withStateDir(async (stateDir) => {
+    let now = 1_000;
+    const oldController = await acquireIdempotencyController({
+      stateDir,
+      heartbeatMs: 0,
+      staleAfterMs: 1_000,
+      now: () => now,
+    });
+    const oldOwner = await readOwner(oldController.controllerLockPath);
+    const originalOpen = fs.open;
+    let entered!: () => void;
+    let resume!: () => void;
+    const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+    const resumePromise = new Promise<void>((resolve) => { resume = resolve; });
+    let intercepted = false;
+    let successor: IdempotencyController | null = null;
+
+    Object.defineProperty(fs, 'open', {
+      configurable: true,
+      writable: true,
+      value: async (...args: Parameters<typeof fs.open>): ReturnType<typeof fs.open> => {
+        const candidate = String(args[0]);
+        if (!intercepted && candidate.includes(`.heartbeat-${oldOwner.nonce}.json.`)) {
+          intercepted = true;
+          entered();
+          await resumePromise;
+        }
+        return originalOpen(...args);
+      },
+    });
+
+    const staleRefresh = oldController.assertOwned();
+    try {
+      await enteredPromise;
+      now = 3_000;
+      successor = await acquireIdempotencyController({
+        stateDir,
+        heartbeatMs: 0,
+        staleAfterMs: 1_000,
+        now: () => now,
+      });
+      const successorBefore = await readOwner(successor.controllerLockPath);
+      assert.notEqual(successorBefore.nonce, oldOwner.nonce);
+
+      resume();
+      await expectIdempotencyError(staleRefresh, 'controller_lost');
+
+      const successorAfter = await readOwner(successor.controllerLockPath);
+      assert.deepEqual(successorAfter, successorBefore, 'stale refresh must never replace successor owner.json');
+      await successor.assertOwned();
+      await expectIdempotencyError(oldController.lookup('req.stale-refresh'), 'controller_lost');
+    } finally {
+      resume();
+      Object.defineProperty(fs, 'open', {
+        configurable: true,
+        writable: true,
+        value: originalOpen,
+      });
+      await staleRefresh.catch(() => undefined);
+      await oldController.release().catch(() => false);
+      if (successor) await successor.release().catch(() => false);
+    }
+  });
+});
+
+test('an in-flight stale acquisition cannot publish owner.json into a successor generation', async () => {
+  await withStateDir(async (stateDir) => {
+    const base = Date.now();
+    let now = base;
+    const originalOpen = fs.open;
+    let entered!: () => void;
+    let resume!: () => void;
+    const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+    const resumePromise = new Promise<void>((resolve) => { resume = resolve; });
+    let intercepted = false;
+    let successor: IdempotencyController | null = null;
+
+    Object.defineProperty(fs, 'open', {
+      configurable: true,
+      writable: true,
+      value: async (...args: Parameters<typeof fs.open>): ReturnType<typeof fs.open> => {
+        const candidate = String(args[0]);
+        if (!intercepted && candidate.endsWith(`${path.sep}owner.json`)) {
+          intercepted = true;
+          entered();
+          await resumePromise;
+        }
+        return originalOpen(...args);
+      },
+    });
+
+    const staleAcquire = acquireIdempotencyController({
+      stateDir,
+      heartbeatMs: 0,
+      staleAfterMs: 1_000,
+      now: () => now,
+    });
+    try {
+      await enteredPromise;
+      now = base + 2_000;
+      successor = await acquireIdempotencyController({
+        stateDir,
+        heartbeatMs: 0,
+        staleAfterMs: 1_000,
+        now: () => now,
+      });
+      const successorBefore = await readOwner(successor.controllerLockPath);
+
+      resume();
+      await expectIdempotencyError(staleAcquire, 'controller_busy');
+
+      const successorAfter = await readOwner(successor.controllerLockPath);
+      assert.deepEqual(successorAfter, successorBefore, 'stale acquirer must never replace successor owner.json');
+      await successor.assertOwned();
+    } finally {
+      resume();
+      Object.defineProperty(fs, 'open', {
+        configurable: true,
+        writable: true,
+        value: originalOpen,
+      });
+      await staleAcquire.catch(() => undefined);
+      if (successor) await successor.release().catch(() => false);
     }
   });
 });

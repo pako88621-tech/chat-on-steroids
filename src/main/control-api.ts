@@ -29,6 +29,7 @@ import { onGoalChange } from './goal.js';
 import { logInfo, logWarn, redact } from './logger.js';
 import { inFlightMcpRequests, inFlightToolCalls, onToolStateChange, runningToolCalls, settlingToolCalls } from './mcp/call-context.js';
 import { pluginManager } from './plugins/manager.js';
+import { onBlockedChatChange } from './session/blocked-chats.js';
 import { onInputChange } from './session/input.js';
 import { onSessionChange } from './session/recorder.js';
 import { updateStatus } from './update.js';
@@ -157,6 +158,7 @@ async function startOnce(): Promise<void> {
   const token = randomBytes(32).toString('base64url');
   const changeBroker = new ControlChangeBroker({
     session: listener => onSessionChange(() => listener()),
+    blocked: onBlockedChatChange,
     input: onInputChange,
     bridge: onBridgeChange,
     goal: onGoalChange,

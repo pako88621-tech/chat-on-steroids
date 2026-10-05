@@ -11,7 +11,7 @@ import {
 type Hook = keyof ControlChangeSubscriptions;
 
 function harness() {
-  const keys: Hook[] = ['session', 'input', 'bridge', 'goal', 'swarm', 'status', 'toolState'];
+  const keys: Hook[] = ['session', 'blocked', 'input', 'bridge', 'goal', 'swarm', 'status', 'toolState'];
   const listeners = new Map<Hook, Set<ControlChangeListener>>(keys.map(key => [key, new Set()]));
   const subscribe = (key: Hook) => (listener: ControlChangeListener) => {
     listeners.get(key)!.add(listener);
@@ -19,6 +19,7 @@ function harness() {
   };
   const broker = new ControlChangeBroker({
     session: subscribe('session'),
+    blocked: subscribe('blocked'),
     input: subscribe('input'),
     bridge: subscribe('bridge'),
     goal: subscribe('goal'),
@@ -55,9 +56,9 @@ describe('Local Control change broker', () => {
 
   it('subscribes to every work-state owner and publishes only an invalidation generation', async () => {
     const h = harness();
-    expect(h.listenerCount()).toBe(7);
+    expect(h.listenerCount()).toBe(8);
     let seq = 0;
-    const keys: Hook[] = ['session', 'input', 'bridge', 'goal', 'swarm', 'status', 'toolState'];
+    const keys: Hook[] = ['session', 'blocked', 'input', 'bridge', 'goal', 'swarm', 'status', 'toolState'];
     for (const key of keys) {
       const cursor = h.broker.snapshot();
       const pending = h.broker.wait({ instanceId: cursor.instanceId, after: cursor.seq });
@@ -200,6 +201,7 @@ describe('Local Control change broker', () => {
         listeners.add(listener);
         return () => { listeners.delete(listener); };
       },
+      blocked: noOp,
       input: () => { throw new Error('subscription failed'); },
       bridge: noOp,
       goal: noOp,

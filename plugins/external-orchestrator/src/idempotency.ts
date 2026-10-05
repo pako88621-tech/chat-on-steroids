@@ -13,6 +13,8 @@ export const IDEMPOTENCY_LEDGER_FILE = 'idempotency.json';
 export const IDEMPOTENCY_CONTROLLER_LOCK = 'controller.lock';
 
 const LOCK_OWNER_FILE = 'owner.json';
+const LOCK_HEARTBEAT_PREFIX = 'heartbeat-';
+const LOCK_HEARTBEAT_SUFFIX = '.json';
 const DEFAULT_HEARTBEAT_MS = 5_000;
 const DEFAULT_STALE_AFTER_MS = 30_000;
 const REQUEST_ID = /^[A-Za-z0-9._:-]{1,160}$/u;
@@ -69,6 +71,11 @@ export class IdempotencyError extends Error {
 interface LockOwner {
   nonce: string;
   createdAt: number;
+  updatedAt: number;
+}
+
+interface LockHeartbeat {
+  nonce: string;
   updatedAt: number;
 }
 
@@ -209,6 +216,19 @@ function isLockOwner(value: unknown): value is LockOwner {
     numericTimestamp(owner.createdAt) && numericTimestamp(owner.updatedAt) && owner.updatedAt >= owner.createdAt;
 }
 
+function isLockHeartbeat(value: unknown): value is LockHeartbeat {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const heartbeat = value as Record<string, unknown>;
+  return exactKeys(heartbeat, ['nonce', 'updatedAt'])
+    && typeof heartbeat.nonce === 'string'
+    && /^[0-9a-f-]{36}$/u.test(heartbeat.nonce)
+    && numericTimestamp(heartbeat.updatedAt);
+}
+
+function heartbeatPath(lockDir: string, nonce: string): string {
+  return path.join(lockDir, `${LOCK_HEARTBEAT_PREFIX}${nonce}${LOCK_HEARTBEAT_SUFFIX}`);
+}
+
 async function ensurePrivateDirectory(directory: string, platform: NodeJS.Platform): Promise<void> {
   await fs.mkdir(directory, { recursive: true, mode: 0o700 });
   if (platform !== 'win32') await fs.chmod(directory, 0o700);
@@ -232,6 +252,22 @@ async function writePrivateJson(file: string, value: unknown, platform: NodeJS.P
   } finally {
     if (handle) await handle.close().catch(() => undefined);
     await fs.rm(temporary, { force: true }).catch(() => undefined);
+  }
+}
+
+/**
+ * Publish a new generation identity without any replace operation. The file handle pins the
+ * directory generation if stale-lock takeover renames it while this write is in flight.
+ */
+async function writePrivateJsonExclusive(file: string, value: unknown, platform: NodeJS.Platform): Promise<void> {
+  let handle: fs.FileHandle | null = null;
+  try {
+    handle = await fs.open(file, 'wx', 0o600);
+    await handle.writeFile(`${JSON.stringify(value)}\n`, 'utf8');
+    await handle.sync();
+    if (platform !== 'win32') await handle.chmod(0o600);
+  } finally {
+    if (handle) await handle.close().catch(() => undefined);
   }
 }
 
@@ -271,9 +307,23 @@ async function readLockOwner(lockDir: string): Promise<LockOwner | null> {
   }
 }
 
+async function readLockHeartbeat(lockDir: string, nonce: string): Promise<LockHeartbeat | null> {
+  try {
+    const parsed: unknown = JSON.parse(await fs.readFile(heartbeatPath(lockDir, nonce), 'utf8'));
+    return isLockHeartbeat(parsed) && parsed.nonce === nonce ? parsed : null;
+  } catch (error) {
+    if (isNodeError(error, 'ENOENT') || isNodeError(error, 'ENOTDIR')) return null;
+    if (error instanceof SyntaxError) return null;
+    throw error;
+  }
+}
+
 async function lockUpdatedAt(lockDir: string): Promise<number | null> {
   const owner = await readLockOwner(lockDir);
-  if (owner) return owner.updatedAt;
+  if (owner) {
+    const heartbeat = await readLockHeartbeat(lockDir, owner.nonce);
+    return heartbeat ? Math.max(owner.updatedAt, heartbeat.updatedAt) : owner.updatedAt;
+  }
   try {
     return Math.trunc((await fs.stat(lockDir)).mtimeMs);
   } catch (error) {
@@ -326,9 +376,18 @@ async function acquireLockDirectory(
       if (platform !== 'win32') await fs.chmod(lockDir, 0o700);
       const owner: LockOwner = { nonce, createdAt: timestamp, updatedAt: timestamp };
       try {
-        await writePrivateJson(path.join(lockDir, LOCK_OWNER_FILE), owner, platform);
+        // Never replace owner.json: a stale acquirer that resumes after takeover must either keep
+        // writing through a handle pinned to its quarantined directory or lose O_EXCL to the
+        // successor generation. This closes the same split-brain class as heartbeat refreshes.
+        await writePrivateJsonExclusive(path.join(lockDir, LOCK_OWNER_FILE), owner, platform);
+        await writePrivateJson(heartbeatPath(lockDir, nonce), { nonce, updatedAt: timestamp } satisfies LockHeartbeat, platform);
+        const published = await readLockOwner(lockDir);
+        if (!published || published.nonce !== nonce || published.createdAt !== timestamp) {
+          throw new IdempotencyError('controller_busy', 'Another External Orchestrator mutation controller won the lock generation.');
+        }
       } catch (error) {
-        await fs.rm(lockDir, { recursive: true, force: true }).catch(() => undefined);
+        // Never remove the canonical directory here: it may already be a successor generation.
+        // A failed/partial generation is recovered only through the ordinary stale-lock path.
         throw error;
       }
       return { lockDir, owner };
@@ -653,8 +712,24 @@ export class IdempotencyController {
 
   async #refreshLock(): Promise<void> {
     const owner = await this.#assertOwned();
-    const timestamp = Math.max(owner.updatedAt, this.#now());
-    await writePrivateJson(path.join(this.controllerLockPath, LOCK_OWNER_FILE), { ...owner, updatedAt: timestamp }, this.#platform);
+    const previousHeartbeat = await readLockHeartbeat(this.controllerLockPath, this.#nonce);
+    const timestamp = Math.max(owner.updatedAt, previousHeartbeat?.updatedAt ?? 0, this.#now());
+    try {
+      // `owner.json` is immutable generation identity. Heartbeats are nonce-scoped so a stalled
+      // controller that resumes after stale-lock takeover can at worst write an ignored old-nonce
+      // heartbeat into the successor directory; it can never replace the successor's owner file.
+      await writePrivateJson(
+        heartbeatPath(this.controllerLockPath, this.#nonce),
+        { nonce: this.#nonce, updatedAt: timestamp } satisfies LockHeartbeat,
+        this.#platform,
+      );
+    } catch (error) {
+      if (isNodeError(error, 'ENOENT') || isNodeError(error, 'ENOTDIR')) {
+        this.#lost = true;
+        throw new IdempotencyError('controller_lost', 'External Orchestrator lost the mutation controller lock while refreshing it.');
+      }
+      throw error;
+    }
     const after = await readLockOwner(this.controllerLockPath);
     if (!after || after.nonce !== this.#nonce || after.createdAt !== this.#createdAt) {
       this.#lost = true;

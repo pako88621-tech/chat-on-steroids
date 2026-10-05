@@ -1376,6 +1376,7 @@ export async function ackGoalDraftNow(
  * Only an explicit master Off also discharges all automatic reply obligations.
  */
 export function retireGoalDrafts(retireReplies = false): number {
+  const hadDrafts = drafts.size > 0;
   let retired = 0;
   for (const draft of drafts.values()) {
     if (draft.acknowledged) continue;
@@ -1401,6 +1402,9 @@ export function retireGoalDrafts(retireReplies = false): number {
     if (retiredReply) commitGoalReplyRetirementSoon();
     else if (goalReplies.size > 0) persistGoalRepliesSoon();
   }
+  // A settled non-retryable failure remains work-blocking even after the page acknowledges it.
+  // Clearing such an acknowledged draft still changes Core work, so invalidate on any removal.
+  if (hadDrafts) notifyGoalChange();
   return retired;
 }
 
@@ -1479,6 +1483,7 @@ export async function setGoalReplyActiveNow(conversationId: string, active: bool
     draft.text = '';
     draft.reply = '';
     drafts.delete(conversationId);
+    notifyGoalChange();
   }
   if (!before) return Boolean(draft);
 
@@ -1684,6 +1689,7 @@ export function discardPreparedGoalDraft(conversationId: string, token: string):
   const draft = drafts.get(conversationId);
   if (!draft || draft.token !== token || draft.work) return false;
   drafts.delete(conversationId);
+  notifyGoalChange();
   return true;
 }
 

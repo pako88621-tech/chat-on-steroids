@@ -1299,6 +1299,15 @@ describe('when OpenRouter refuses', () => {
     // reason and acknowledges the draft. The failure must stay the chat's Goal state: hiding it left
     // only the still-owed reply, which read as "Answer settling" forever.
     const sessionId = await seed('c-no-credit');
+    await goal.acceptGoalReplyNow({
+      conversationId: 'c-no-credit',
+      sessionId,
+      replyId: 'reply-no-credit',
+      turnId: 'g-1',
+      eventSeq: 1,
+      blocked: false
+    });
+    expect(goal.goalPendingReplyFor('c-no-credit')).not.toBeNull();
     globalThis.fetch = (async () => new Response(JSON.stringify({ error: { message: 'Insufficient credits' } }), { status: 402 })) as never;
     goal.startGoalDraft({ sessionId, conversationId: 'c-no-credit', turnId: 'g-1' });
     const failed = await settled('c-no-credit');
@@ -1311,6 +1320,13 @@ describe('when OpenRouter refuses', () => {
     try {
       expect(goal.goalViewFor('c-no-credit')).toMatchObject({ stage: 'failed', error: expect.stringContaining('out_of_credit') });
     } finally { clock.mockRestore(); }
+    expect(goal.goalDraftNeedsIntervention('c-no-credit')).toBe(true);
+    const invalidations: boolean[] = [];
+    const unsubscribe = goal.onGoalChange(() => invalidations.push(goal.goalDraftNeedsIntervention('c-no-credit')));
+    expect(goal.retireGoalDrafts()).toBe(0);
+    unsubscribe();
+    expect(goal.goalDraftNeedsIntervention('c-no-credit')).toBe(false);
+    expect(invalidations).toContain(false);
 
     // A failure the page retries on its own clock is still hidden once acknowledged.
     const retrySession = await seed('c-busy');

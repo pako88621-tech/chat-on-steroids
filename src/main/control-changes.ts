@@ -27,6 +27,7 @@ export type ControlChangeSubscribe = (listener: ControlChangeListener) => () => 
  */
 export interface ControlChangeSubscriptions {
   session: ControlChangeSubscribe;
+  blocked: ControlChangeSubscribe;
   input: ControlChangeSubscribe;
   bridge: ControlChangeSubscribe;
   goal: ControlChangeSubscribe;
@@ -80,6 +81,7 @@ export class ControlChangeBroker {
     try {
       const subscriptions: ControlChangeSubscribe[] = [
         this.subscriptions.session,
+        this.subscriptions.blocked,
         this.subscriptions.input,
         this.subscriptions.bridge,
         this.subscriptions.goal,

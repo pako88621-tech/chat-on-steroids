@@ -875,6 +875,30 @@ describe('stopping one exact active turn', () => {
 });
 
 describe('cancelling', () => {
+  it('rechecks Allow actions after the session lookup and before the cancel owner', async () => {
+    const sent = await post('/v1/inputs', sendBody());
+    expect(sent.status).toBe(202);
+    const real = readModel.readSession;
+    const reads = vi.spyOn(readModel, 'readSession').mockImplementationOnce(async (id) => {
+      const session = await real(id);
+      gate.actions = false;
+      return session;
+    });
+    const cancels = vi.spyOn(startInput, 'cancelDesktopInput');
+    const before = cancels.mock.calls.length;
+    try {
+      const reply = await post('/v1/inputs/' + sent.body.input.id + '/cancel');
+      expect(reply.status).toBe(403);
+      expect(reply.body).toEqual({ error: 'actions_disabled' });
+      expect(cancels.mock.calls.length).toBe(before);
+      expect((await outbox()).find((entry) => entry.id === sent.body.input.id)?.state).toBe('queued');
+    } finally {
+      reads.mockRestore();
+      cancels.mockRestore();
+      gate.actions = true;
+    }
+  });
+
   it('withdraws a queued message and says it was not sent', async () => {
     const sent = await post('/v1/inputs', sendBody());
     const id = sent.body.input.id;

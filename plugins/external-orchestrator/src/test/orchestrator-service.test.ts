@@ -139,6 +139,7 @@ class FakeClient {
   snapshotChangesHook: (() => Promise<ControlChangesDto>) | null = null;
   snapshotChangeCalls = 0;
   semanticReadCalls = 0;
+  getHook: ((path: string, options?: ControlRequestOptions) => Promise<ControlHttpResponse<unknown>>) | null = null;
 
   async health(): Promise<ControlHealthSnapshot> {
     this.healthCalls += 1;
@@ -218,7 +219,8 @@ class FakeClient {
     return { events: filtered, total: this.semanticEvents.length, nextFrom: filtered.length ? nextFrom : from ?? this.nextFrom };
   }
 
-  async get<T = unknown>(_path: string, _options?: ControlRequestOptions): Promise<ControlHttpResponse<T>> {
+  async get<T = unknown>(path: string, options?: ControlRequestOptions): Promise<ControlHttpResponse<T>> {
+    if (this.getHook) return await this.getHook(path, options) as ControlHttpResponse<T>;
     throw new Error('unexpected GET');
   }
 
@@ -434,6 +436,35 @@ test('status reports working/idle state from live/outbox state and preserves the
   assert.equal(client.postCalls.length, 0);
 });
 
+test('legacy activity wait follows the exact durable session across Compact & Resume', async () => {
+  const client = new FakeClient();
+  const api = service(client, new FakeController());
+  let moved = false;
+  client.getHook = async (path) => {
+    assert.match(path, new RegExp(`/v1/sessions/${SESSION_ID}/events\\?from=0&limit=1`));
+    if (!moved) {
+      moved = true;
+      client.detail = {
+        session: { ...client.detail.session, conversationId: 'conversation-2', updatedAt: 200 },
+        live: { activeTurnId: 'turn-after-compaction', blocked: '' },
+      };
+    }
+    return response(200, {
+      events: [{ seq: 0, time: 1, kind: 'assistant_message', summary: 'Compaction moved this session.' }],
+      total: 1,
+      nextFrom: 1,
+    });
+  };
+
+  const result = await api.orchestrate(externalOrchestrateRequestSchema.parse({
+    action: 'wait', until: 'activity', session_id: SESSION_ID, cursor: 0, wait_ms: 100,
+  }));
+  assert.equal(result.ok, true);
+  assert.equal(result.session_id, SESSION_ID);
+  assert.equal(result.active_turn_id, 'turn-after-compaction');
+  assert.equal(result.state, 'working');
+});
+
 function enableSemanticWait(
   client: FakeClient,
   work: NonNullable<NonNullable<SessionSelectionDetail['live']>['work']>,
@@ -474,6 +505,34 @@ test('semantic terminal wait returns only after canonical final/end agree with C
   assert.equal(result.cursor, 13);
   assert.equal(result.state, 'idle');
   assert.equal(client.waitForChangeCalls.length, 0);
+});
+
+test('semantic stable cut includes current health even when authority changes before the first snapshot', async () => {
+  const client = new FakeClient();
+  enableSemanticWait(client, { state: 'quiescent', reasons: [], nextDeadline: null });
+  client.semanticEvents = [
+    { seq: 14, position: 14, time: 14, kind: 'assistant_message', source: 'extension', turnId: TURN_ID, final: true, state: 'final' },
+    { seq: 15, position: 15, time: 15, kind: 'turn_end', source: 'extension', turnId: TURN_ID, outcome: 'completed' },
+  ];
+  let firstSnapshot = true;
+  client.snapshotChangesHook = async () => {
+    if (firstSnapshot) {
+      firstSnapshot = false;
+      client.healthSnapshot = {
+        ...client.healthSnapshot,
+        actions: { ...client.healthSnapshot.actions, enabled: false },
+      };
+    }
+    return { instanceId: client.changesInstance, seq: client.changesSeq, reason: 'snapshot' };
+  };
+  const api = service(client, new FakeController());
+  const result = await api.orchestrate(externalOrchestrateRequestSchema.parse({
+    action: 'wait', until: 'terminal', session_id: SESSION_ID,
+  }));
+  assert.equal(result.wake_reason, 'completed');
+  assert.equal(result.actions_enabled, false);
+  assert.ok(client.healthCalls >= 2, 'health must be refreshed inside the stable semantic cut');
+  assert.equal(client.waitForChangeCalls.length, 0, 'already-present terminal evidence must not park first');
 });
 
 test('semantic wait parks once on the change broker and rereads only after invalidation', async () => {

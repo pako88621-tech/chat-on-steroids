@@ -423,7 +423,7 @@ export class ExternalOrchestratorService {
       bearerTokens: this.#client.sanitizationTokens(),
       signal,
     });
-    const refreshed = await this.#selector.revalidateForMutation(selection).catch(() => selection);
+    const refreshed = await this.#selector.revalidateForRead(selection);
     const inputs = await this.#client.listInputs({ limit: INPUT_LOOKUP_LIMIT });
     return this.#success(health, refreshed, {
       state: stateFor(refreshed, inputs.inputs),
@@ -470,8 +470,10 @@ export class ExternalOrchestratorService {
       for (;;) {
         if (signal?.aborted) throw new ControlClientError('request_aborted');
         if (leaseDeadline !== null && Date.now() >= leaseDeadline) {
+          const leaseHealth = await this.#client.health();
+          if (!this.#client.supportsSemanticWait(leaseHealth)) return this.#failure('wait_unavailable', leaseHealth, selection);
           this.#semanticMemory.set(id, memory);
-          return this.#success(this.#client.currentHealth() ?? health, selection, {
+          return this.#success(leaseHealth, selection, {
             state: stateForSemantic(selection),
             cursor: restartSafeSemanticCursor(memory, cursor ?? 0),
             wake_reason: 'transport_lease_expired',
@@ -497,6 +499,15 @@ export class ExternalOrchestratorService {
         if (!sameChangeCut(s0, s1)) {
           // Stable-cut rule: none of the composite state above is committed.
           continue;
+        }
+        const stableHealth = await this.#client.health();
+        const s2 = await this.#client.snapshotChanges({ signal });
+        if (!sameChangeCut(s1, s2)) {
+          // Health/action authority is part of the same observable cut as work + recorder facts.
+          continue;
+        }
+        if (!this.#client.supportsSemanticWait(stableHealth)) {
+          return this.#failure('wait_unavailable', stableHealth, refreshed);
         }
 
         selection = refreshed;
@@ -557,7 +568,7 @@ export class ExternalOrchestratorService {
             memory = { ...memory, settle: emptyTerminalSettleState() };
             this.#semanticMemory.set(id, memory);
           }
-          return this.#success(this.#client.currentHealth() ?? health, selection, {
+          return this.#success(stableHealth, selection, {
             state: stateForSemantic(selection),
             cursor: responseCursor,
             wake_reason: selectedDecision.wakeReason,
@@ -565,7 +576,7 @@ export class ExternalOrchestratorService {
           });
         }
         if (deferredCheckpoint !== null) {
-          return this.#success(this.#client.currentHealth() ?? health, selection, {
+          return this.#success(stableHealth, selection, {
             state: stateForSemantic(selection),
             cursor: restartSafeSemanticCursor(memory),
             wake_reason: 'checkpoint',
@@ -580,7 +591,7 @@ export class ExternalOrchestratorService {
         const leaseRemaining = leaseDeadline === null ? null : Math.max(0, leaseDeadline - now);
         if (coreRemaining === 0) continue;
         if (leaseRemaining === 0) {
-          return this.#success(this.#client.currentHealth() ?? health, selection, {
+          return this.#success(stableHealth, selection, {
             state: stateForSemantic(selection),
             cursor: restartSafeSemanticCursor(memory),
             wake_reason: 'transport_lease_expired',
@@ -600,20 +611,13 @@ export class ExternalOrchestratorService {
 
         try {
           await this.#client.waitForChange(
-            { instanceId: s1.instanceId, after: s1.seq },
+            { instanceId: s2.instanceId, after: s2.seq },
             { ...(timeoutMs === undefined ? {} : { timeoutMs: Math.max(1, Math.trunc(timeoutMs)) }), signal },
           );
-          // `/v1/changes` also invalidates same-epoch configuration such as Allow actions. Refresh
-          // health only after a real invalidation/reset so user-visible capability fields cannot
-          // remain stale while the semantic wait itself stays event-driven.
-          const refreshedHealth = await this.#client.health();
-          if (!this.#client.supportsSemanticWait(refreshedHealth)) {
-            return this.#failure('wait_unavailable', refreshedHealth, selection);
-          }
         } catch (error) {
           if (error instanceof ControlClientError && error.code === 'request_timeout' && timeoutKind !== null) {
             if (timeoutKind === 'core') continue;
-            return this.#success(this.#client.currentHealth() ?? health, selection, {
+            return this.#success(stableHealth, selection, {
               state: stateForSemantic(selection),
               cursor: restartSafeSemanticCursor(memory),
               wake_reason: 'transport_lease_expired',

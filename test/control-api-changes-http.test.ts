@@ -22,6 +22,7 @@ const { initConfigPath } = await import('../src/main/config.js');
 const { initSecretsPath } = await import('../src/main/secrets.js');
 const controlApi = await import('../src/main/control-api.js');
 const { notifyChanged } = await import('../src/main/session/recorder.js');
+const { setChatBlocked } = await import('../src/main/session/blocked-chats.js');
 
 let dir: string;
 
@@ -148,6 +149,23 @@ describe('Local Control change feed over HTTP', () => {
     expect(changed.status).toBe(200);
     expect(changed.body).toMatchObject({ instanceId: snapshot.instanceId, reason: 'changed' });
     expect(changed.body.seq).toBeGreaterThan(snapshot.seq);
+  });
+
+  it('wakes when the blocked-chat owner changes work state', async () => {
+    await controlApi.startControlApi();
+    const { port, token } = await endpoint();
+    const snapshot = (await get(port, token, '/v1/changes')).body;
+    const wait = heldGet(port, token, '/v1/changes?instance=' + snapshot.instanceId + '&after=' + snapshot.seq);
+    const conversationId = 'chat-changes-blocked';
+    try {
+      setChatBlocked(conversationId, true);
+      const changed = await wait.result;
+      expect(changed.status).toBe(200);
+      expect(changed.body).toMatchObject({ instanceId: snapshot.instanceId, reason: 'changed' });
+      expect(changed.body.seq).toBeGreaterThan(snapshot.seq);
+    } finally {
+      setChatBlocked(conversationId, false);
+    }
   });
 
   it('does not consume ordinary unfinished-read slots and client cancellation releases held watches', async () => {

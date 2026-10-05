@@ -292,6 +292,63 @@ it('publishes a Goal invalidation when a handled reply is deliberately re-armed'
   }
 });
 
+it('publishes a Goal invalidation when a prepared draft reservation is discarded', () => {
+  const conversationId = 'goal-discard-notify';
+  const draft = goal.startGoalDraft({
+    conversationId,
+    sessionId: 'session-discard-notify',
+    turnId: 'turn-discard-notify',
+    deferStart: true
+  });
+  const observed: boolean[] = [];
+  const unsubscribe = goal.onGoalChange(() => observed.push(goal.goalDraftBusy(conversationId)));
+  try {
+    expect(goal.discardPreparedGoalDraft(conversationId, draft.token)).toBe(true);
+    expect(goal.goalDraftBusy(conversationId)).toBe(false);
+    expect(observed).toContain(false);
+  } finally {
+    unsubscribe();
+  }
+});
+
+it('publishes a Goal invalidation when reply activation retires an in-flight draft', async () => {
+  const conversationId = 'goal-active-retire-notify';
+  goal.startGoalDraft({
+    conversationId,
+    sessionId: 'session-active-retire-notify',
+    turnId: 'turn-active-retire-notify',
+    deferStart: true
+  });
+  const observed: boolean[] = [];
+  const unsubscribe = goal.onGoalChange(() => observed.push(goal.goalDraftBusy(conversationId)));
+  try {
+    await expect(goal.setGoalReplyActiveNow(conversationId, false)).resolves.toBe(true);
+    expect(goal.goalDraftBusy(conversationId)).toBe(false);
+    expect(observed).toContain(false);
+  } finally {
+    unsubscribe();
+  }
+});
+
+it('publishes a Goal invalidation when settings retirement clears active drafts', () => {
+  const conversationId = 'goal-retire-all-notify';
+  goal.startGoalDraft({
+    conversationId,
+    sessionId: 'session-retire-all-notify',
+    turnId: 'turn-retire-all-notify',
+    deferStart: true
+  });
+  const observed: boolean[] = [];
+  const unsubscribe = goal.onGoalChange(() => observed.push(goal.goalDraftBusy(conversationId)));
+  try {
+    expect(goal.retireGoalDrafts()).toBe(1);
+    expect(goal.goalDraftBusy(conversationId)).toBe(false);
+    expect(observed).toContain(false);
+  } finally {
+    unsubscribe();
+  }
+});
+
 it('projects the exact pending Goal TTL as a Core-owned deadline', async () => {
   const conversationId = 'goal-expiry-deadline';
   await acceptPending(conversationId, 'session-expiry-deadline', 1, 'reply-expiry', 'turn-expiry');
