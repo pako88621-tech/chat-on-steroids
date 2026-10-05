@@ -11,6 +11,7 @@ import {
   ControlClientError,
   ControlRemoteError,
   createControlClient,
+  parseControlCancelResult,
 } from './control-client.js';
 import {
   EvidenceReadError,
@@ -86,6 +87,7 @@ interface SemanticSessionMemory {
   cursor: number | null;
   checkpoint: CheckpointState;
   settle: TerminalSettleState;
+  /** True only after this process has reached one stable recorder tail for this session. */
   initialized: boolean;
   lastTurnStartSeq: number | null;
 }
@@ -184,6 +186,22 @@ function sameChangeCut(left: ControlChangesDto, right: ControlChangesDto): boole
 function stateForSemantic(selection: SelectedSession): 'idle' | 'working' {
   const work = selection.live.work;
   return work?.state === 'quiescent' ? 'idle' : 'working';
+}
+
+function terminalWake(reason: NonNullable<ExternalOrchestrateResponse['wake_reason']>): boolean {
+  return reason === 'completed' || reason === 'failed' || reason === 'stalled' || reason === 'stopped';
+}
+
+/**
+ * A wire cursor must survive an EO process restart. If terminal evidence is only partially settled,
+ * expose the earliest retained terminal fact rather than the process-local read head so a fresh EO
+ * can replay enough Core evidence to reconstruct the settle barrier.
+ */
+function restartSafeSemanticCursor(memory: SemanticSessionMemory, fallback = 0): number {
+  const head = memory.cursor ?? fallback;
+  const anchors = [memory.settle.finalSeq, memory.settle.endSeq, memory.settle.postEndActivitySeq]
+    .filter((value): value is number => value !== null);
+  return anchors.length === 0 ? head : Math.min(head, ...anchors);
 }
 
 function wakeSummary(reason: NonNullable<ExternalOrchestrateResponse['wake_reason']>, checkpoint?: string): string {
@@ -430,17 +448,21 @@ export class ExternalOrchestratorService {
 
     const leaseDeadline = transportLeaseMs === undefined ? null : Date.now() + transportLeaseMs;
     let memory = this.#semanticMemory.get(id);
-    if (!memory || (cursor !== undefined && memory.cursor !== cursor)) {
+    if (!memory) {
       memory = {
         cursor: cursor ?? null,
         checkpoint: checkpointStateForTurn(null, false),
         settle: emptyTerminalSettleState(),
-        // An explicit event cursor is a caller-owned observation boundary. A later canonical
-        // turn_start can therefore safely establish a fresh checkpoint budget. Attaching without
-        // a cursor remains conservative because prior checkpoint history may be unknowable.
-        initialized: cursor !== undefined,
+        // A fresh process cannot know how much checkpoint budget the caller already consumed.
+        // Stay suppressed through the initial bounded backlog; only a turn_start observed after
+        // reaching one stable tail can establish a fresh budget.
+        initialized: false,
         lastTurnStartSeq: null,
       };
+    } else if (cursor !== undefined && memory.cursor !== cursor) {
+      // The explicit cursor remains the caller-owned observation boundary, but rewinding/advancing
+      // it must not erase process-known checkpoint budget or terminal settle evidence.
+      memory = { ...memory, cursor };
     }
     let deferredCheckpoint: { summary?: string } | null = null;
 
@@ -451,7 +473,7 @@ export class ExternalOrchestratorService {
           this.#semanticMemory.set(id, memory);
           return this.#success(this.#client.currentHealth() ?? health, selection, {
             state: stateForSemantic(selection),
-            cursor: memory.cursor ?? cursor ?? 0,
+            cursor: restartSafeSemanticCursor(memory, cursor ?? 0),
             wake_reason: 'transport_lease_expired',
             summary: wakeSummary('transport_lease_expired'),
           });
@@ -466,7 +488,7 @@ export class ExternalOrchestratorService {
         const page: { events: ControlSemanticEventDto[]; total: number; nextFrom: number } = from === null
           ? await this.#client.readSemanticEvents(id, { limit: SEMANTIC_EVENT_PAGE_SIZE })
           : await this.#client.readSemanticEvents(id, { from, limit: SEMANTIC_EVENT_PAGE_SIZE });
-        let caughtUp = from === null || page.events.length < SEMANTIC_EVENT_PAGE_SIZE;
+        let caughtUp: boolean = from === null || page.events.length < SEMANTIC_EVENT_PAGE_SIZE;
         if (!caughtUp) {
           const lookahead = await this.#client.readSemanticEvents(id, { from: page.nextFrom, limit: 1 });
           caughtUp = lookahead.events.length === 0;
@@ -505,7 +527,7 @@ export class ExternalOrchestratorService {
           cursor: page.nextFrom,
           checkpoint: decision.checkpoint,
           settle: decision.settle,
-          initialized: true,
+          initialized: memory.initialized || caughtUp,
           lastTurnStartSeq: memory.lastTurnStartSeq,
         };
         this.#semanticMemory.set(id, memory);
@@ -525,9 +547,19 @@ export class ExternalOrchestratorService {
           const selectedDecision = deferredCheckpoint !== null && decision.wakeReason === 'checkpoint'
             ? { wakeReason: 'checkpoint' as const, checkpointSummary: deferredCheckpoint.summary }
             : decision;
+          const responseCursor = terminalWake(selectedDecision.wakeReason)
+            ? memory.cursor ?? 0
+            : restartSafeSemanticCursor(memory);
+          if (terminalWake(selectedDecision.wakeReason)) {
+            // Terminal boundaries are one-shot semantic wakes. Keep the consumed event cursor and
+            // checkpoint history, but do not let process-local settle state emit the same boundary
+            // again on a later wait with no new Core evidence.
+            memory = { ...memory, settle: emptyTerminalSettleState() };
+            this.#semanticMemory.set(id, memory);
+          }
           return this.#success(this.#client.currentHealth() ?? health, selection, {
             state: stateForSemantic(selection),
-            cursor: memory.cursor ?? 0,
+            cursor: responseCursor,
             wake_reason: selectedDecision.wakeReason,
             summary: wakeSummary(selectedDecision.wakeReason, selectedDecision.checkpointSummary),
           });
@@ -535,7 +567,7 @@ export class ExternalOrchestratorService {
         if (deferredCheckpoint !== null) {
           return this.#success(this.#client.currentHealth() ?? health, selection, {
             state: stateForSemantic(selection),
-            cursor: memory.cursor ?? 0,
+            cursor: restartSafeSemanticCursor(memory),
             wake_reason: 'checkpoint',
             summary: wakeSummary('checkpoint', deferredCheckpoint.summary),
           });
@@ -550,7 +582,7 @@ export class ExternalOrchestratorService {
         if (leaseRemaining === 0) {
           return this.#success(this.#client.currentHealth() ?? health, selection, {
             state: stateForSemantic(selection),
-            cursor: memory.cursor ?? 0,
+            cursor: restartSafeSemanticCursor(memory),
             wake_reason: 'transport_lease_expired',
             summary: wakeSummary('transport_lease_expired'),
           });
@@ -571,12 +603,19 @@ export class ExternalOrchestratorService {
             { instanceId: s1.instanceId, after: s1.seq },
             { ...(timeoutMs === undefined ? {} : { timeoutMs: Math.max(1, Math.trunc(timeoutMs)) }), signal },
           );
+          // `/v1/changes` also invalidates same-epoch configuration such as Allow actions. Refresh
+          // health only after a real invalidation/reset so user-visible capability fields cannot
+          // remain stale while the semantic wait itself stays event-driven.
+          const refreshedHealth = await this.#client.health();
+          if (!this.#client.supportsSemanticWait(refreshedHealth)) {
+            return this.#failure('wait_unavailable', refreshedHealth, selection);
+          }
         } catch (error) {
           if (error instanceof ControlClientError && error.code === 'request_timeout' && timeoutKind !== null) {
             if (timeoutKind === 'core') continue;
             return this.#success(this.#client.currentHealth() ?? health, selection, {
               state: stateForSemantic(selection),
-              cursor: memory.cursor ?? 0,
+              cursor: restartSafeSemanticCursor(memory),
               wake_reason: 'transport_lease_expired',
               summary: wakeSummary('transport_lease_expired'),
             });
@@ -584,7 +623,7 @@ export class ExternalOrchestratorService {
           if (error instanceof ControlClientError && error.code === 'unsupported_control_api') {
             return this.#success(this.#client.currentHealth() ?? health, selection, {
               state: stateForSemantic(selection),
-              cursor: memory.cursor ?? 0,
+              cursor: restartSafeSemanticCursor(memory),
               wake_reason: 'control_lost',
               summary: wakeSummary('control_lost'),
             });
@@ -593,7 +632,7 @@ export class ExternalOrchestratorService {
             if (await this.#recoverSemanticReadAfterRestart(signal)) continue;
             return this.#success(this.#client.currentHealth() ?? health, selection, {
               state: stateForSemantic(selection),
-              cursor: memory.cursor ?? 0,
+              cursor: restartSafeSemanticCursor(memory),
               wake_reason: 'control_lost',
               summary: wakeSummary('control_lost'),
             });
@@ -605,7 +644,7 @@ export class ExternalOrchestratorService {
       if (error instanceof SessionSelectionError && error.code === 'session_ineligible') {
         return this.#success(this.#client.currentHealth() ?? health, selection, {
           state: 'working',
-          cursor: memory.cursor ?? cursor ?? 0,
+          cursor: restartSafeSemanticCursor(memory, cursor ?? 0),
           wake_reason: 'control_lost',
           summary: wakeSummary('control_lost'),
         });
@@ -852,8 +891,17 @@ export class ExternalOrchestratorService {
     }
     if (response.ambiguous) return this.#failure('delivery_unknown', health, undefined, { input_id: owned.inputId, delivery: 'unconfirmed' });
     if (response.status !== 200) return this.#remoteFailure(response, health, undefined, owned.inputId);
-    const after = await this.#findInput(owned.inputId);
-    if (after?.delivery === 'not_sent') {
+    const cancelled = parseControlCancelResult(response.body);
+    const after = cancelled.input;
+    this.#assertInputOwnership(after, owned.sessionId);
+    if (inputInstanceProof(after) !== owned.inputProofHash) {
+      await controller.markConflict({ record: owned, replayed: true });
+      return this.#failure('duplicate_request_conflict', health, undefined, {
+        input_id: owned.inputId,
+        summary: 'The deterministic UUID changed Core input instance while cancellation was settling.',
+      });
+    }
+    if (after.delivery === 'not_sent') {
       await controller.markNotSent({ record: owned, replayed: true });
     }
     return {
@@ -864,7 +912,7 @@ export class ExternalOrchestratorService {
       session_id: owned.sessionId,
       project_id: null,
       state: 'idle',
-      summary: after?.delivery === 'not_sent' ? 'Owned pending input was cancelled before delivery.' : 'Cancel request completed.',
+      summary: after.delivery === 'not_sent' ? 'Owned pending input was cancelled before delivery.' : 'Cancel request completed.',
       input_id: owned.inputId,
       active_turn_id: null,
       delivery: deliveryOf(after),

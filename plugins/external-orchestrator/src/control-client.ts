@@ -228,6 +228,11 @@ export interface ControlInputsPageDto {
   total: number;
 }
 
+export interface ControlCancelResultDto {
+  input: ControlInputDto;
+  cancelled: boolean;
+}
+
 export interface ControlEventChangeDto {
   path: string;
   added: number;
@@ -493,6 +498,10 @@ const inputsPageSchema = z.object({
   inputs: z.array(controlInputSchema).max(500),
   total: safeInteger,
 });
+const cancelResultSchema = z.object({
+  input: controlInputSchema,
+  cancelled: z.boolean(),
+}).strict();
 const eventChangeSchema = z.object({
   path: z.string().max(1_000),
   added: safeInteger,
@@ -741,6 +750,10 @@ function parseDto<T>(schema: z.ZodType<T>, body: unknown): T {
   const parsed = schema.safeParse(body);
   if (!parsed.success) throw new ControlClientError('invalid_response');
   return parsed.data;
+}
+
+export function parseControlCancelResult(body: unknown): ControlCancelResultDto {
+  return parseDto(cancelResultSchema, body);
 }
 
 function remoteCodeOf(body: unknown): string | null {
