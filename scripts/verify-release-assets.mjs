@@ -3,6 +3,7 @@ import { createReadStream, existsSync, readFileSync, writeFileSync } from 'node:
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { strFromU8, unzipSync } from 'fflate';
+import { EXTERNAL_ORCHESTRATOR_RELEASE_FILE } from './release-targets.mjs';
 
 /** The files release.yml publishes, in its SHA256SUMS.txt order. */
 export const RELEASE_FILES = [
@@ -17,7 +18,8 @@ export const RELEASE_FILES = [
   'Chat-On-Steroids-Linux-arm64.AppImage',
   'Chat-On-Steroids-Linux-arm64.deb',
   'Chat-On-Steroids-Extension.zip',
-  'Chat-On-Steroids-Native-Sources.tar.gz'
+  'Chat-On-Steroids-Native-Sources.tar.gz',
+  EXTERNAL_ORCHESTRATOR_RELEASE_FILE
 ];
 const EXTENSION = 'Chat-On-Steroids-Extension.zip';
 

@@ -1,5 +1,5 @@
 // @ts-expect-error The target planner is a plain Node script without type declarations.
-import { releaseTargets } from '../scripts/release-targets.mjs';
+import { EXTERNAL_ORCHESTRATOR_RELEASE_FILE, releaseTargets } from '../scripts/release-targets.mjs';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -165,7 +165,7 @@ describe('cross-platform packaging targets', () => {
     expect(releaseTargets('common').include.map((target: { name: string }) => target.name)).toEqual(['Windows x64', 'macOS arm64', 'Linux x64']);
     expect(releaseTargets('common').files).toEqual(['Chat-On-Steroids-Setup-x64.exe', 'Chat-On-Steroids-macOS-arm64.dmg',
       'Chat-On-Steroids-macOS-arm64.zip', 'Chat-On-Steroids-Linux-x64.AppImage', 'Chat-On-Steroids-Linux-x64.deb',
-      'Chat-On-Steroids-Extension.zip', 'Chat-On-Steroids-Native-Sources.tar.gz']);
+      'Chat-On-Steroids-Extension.zip', 'Chat-On-Steroids-Native-Sources.tar.gz', EXTERNAL_ORCHESTRATOR_RELEASE_FILE]);
     expect(() => releaseTargets('some')).toThrow();
     const canary = yamlFile('.github/workflows/canary.yml');
     expect(canary.jobs.candidate.with).toEqual({ platforms: 'common' });
@@ -691,6 +691,7 @@ Load command 11
       'Chat-On-Steroids-Linux-arm64.AppImage',
       'Chat-On-Steroids-Linux-arm64.deb',
       'Chat-On-Steroids-Extension.zip',
+      EXTERNAL_ORCHESTRATOR_RELEASE_FILE,
       'SHA256SUMS.txt'
     ];
     const checksumStep = release.slice(
@@ -703,10 +704,12 @@ Load command 11
     // and the candidate upload take exactly that plan.
     expect(checksumStep).toContain('FILES: ${{ needs.plan.outputs.files }}');
     expect(candidateUpload).toContain('release/Chat-On-Steroids-*');
+    expect(candidateUpload).toContain('release/chat-on-steroids-external-orchestrator-*.mcpb');
     expect(candidateUpload).toContain('release/SHA256SUMS.txt');
     const planned = releaseTargets('all').files;
     for (const artifact of artifacts) {
-      expect(publishStep).toContain(artifact);
+      if (artifact === EXTERNAL_ORCHESTRATOR_RELEASE_FILE) expect(publishStep).toContain('"publish/$eo_file"');
+      else expect(publishStep).toContain(artifact);
       if (artifact !== 'SHA256SUMS.txt') expect(planned).toContain(artifact);
     }
   });
