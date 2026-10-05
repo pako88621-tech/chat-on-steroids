@@ -7,7 +7,9 @@
 import { appendFileSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-const ALWAYS = ['Chat-On-Steroids-Extension.zip', 'Chat-On-Steroids-Native-Sources.tar.gz'];
+const eoPackage = JSON.parse(readFileSync(new URL('../plugins/external-orchestrator/package.json', import.meta.url), 'utf8'));
+export const EXTERNAL_ORCHESTRATOR_RELEASE_FILE = `chat-on-steroids-external-orchestrator-${eoPackage.version}.mcpb`;
+const ALWAYS = ['Chat-On-Steroids-Extension.zip', 'Chat-On-Steroids-Native-Sources.tar.gz', EXTERNAL_ORCHESTRATOR_RELEASE_FILE];
 
 export function releaseTargets(platforms = 'all', targets = JSON.parse(readFileSync(new URL('../.github/release-targets.json', import.meta.url), 'utf8'))) {
   if (platforms !== 'all' && platforms !== 'common') throw new Error(`platforms must be all or common, got ${platforms}`);

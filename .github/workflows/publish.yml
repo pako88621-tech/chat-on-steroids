@@ -158,6 +158,7 @@ jobs:
           # the six runners were working cannot leave this release stale.
           npm run verify:tunnel-current
           node scripts/check-release-absent.mjs
+          eo_file="$(node -p "'chat-on-steroids-external-orchestrator-' + require('./plugins/external-orchestrator/package.json').version + '.mcpb'")"
           gh release create "$TAG" \
             publish/Chat-On-Steroids-Setup-x64.exe \
             publish/Chat-On-Steroids-Setup-arm64.exe \
@@ -171,6 +172,7 @@ jobs:
             publish/Chat-On-Steroids-Linux-arm64.deb \
             publish/Chat-On-Steroids-Extension.zip \
             publish/Chat-On-Steroids-Native-Sources.tar.gz \
+            "publish/$eo_file" \
             publish/SHA256SUMS.txt \
             --title "$(sed -n 's/^## //p' "docs/release-notes/$TAG.md" | head -n 1)" \
             --notes-file "docs/release-notes/$TAG.md"

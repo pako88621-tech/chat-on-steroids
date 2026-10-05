@@ -321,6 +321,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: plugins/external-orchestrator/package-lock.json
+
       - name: Download packages
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -339,6 +345,15 @@ jobs:
           for required in manifest.json build-stamp.txt background.js chatgpt-dom.js content.js fiber.js overlay.css popup.html popup.css popup.js icons/icon16.png icons/icon32.png icons/icon48.png icons/icon128.png LICENSE; do
             unzip -Z1 release/Chat-On-Steroids-Extension.zip | grep -Fxq "$required" || { echo "Extension zip missing $required" >&2; exit 1; }
           done
+
+      - name: Package standalone External Orchestrator MCPB
+        run: |
+          set -euo pipefail
+          npm --prefix plugins/external-orchestrator ci --ignore-scripts --no-audit --no-fund
+          npm --prefix plugins/external-orchestrator run verify
+          eo_file="$(node -p "'chat-on-steroids-external-orchestrator-' + require('./plugins/external-orchestrator/package.json').version + '.mcpb'")"
+          cp "plugins/external-orchestrator/release/$eo_file" "release/$eo_file"
+          test -s "release/$eo_file"
 
       - name: Create SHA-256 checksums
         env:
@@ -359,6 +374,7 @@ jobs:
           name: chat-on-steroids-candidate-${{ github.run_id }}
           path: |
             release/Chat-On-Steroids-*
+            release/chat-on-steroids-external-orchestrator-*.mcpb
             release/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30

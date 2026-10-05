@@ -1,0 +1,25 @@
+{
+  "manifest_version": "0.3",
+  "name": "chat-on-steroids-external-orchestrator",
+  "display_name": "External Orchestrator",
+  "version": "0.1.0",
+  "description": "Portable local MCP bridge that lets an external coding agent direct Chat On Steroids through its Local Control API.",
+  "author": { "name": "Chat On Steroids" },
+  "license": "MIT",
+  "server": {
+    "type": "node",
+    "entry_point": "dist/stdio.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/dist/stdio.js"]
+    }
+  },
+  "tools": [
+    { "name": "cos_orchestrate", "description": "Direct or observe work in an eligible Chat On Steroids Prime session." },
+    { "name": "cos_evidence", "description": "Read bounded evidence from the selected Chat On Steroids session." }
+  ],
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": { "node": ">=20" }
+  }
+}

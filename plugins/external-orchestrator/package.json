@@ -1,0 +1,33 @@
+{
+  "name": "@chat-on-steroids/external-orchestrator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Portable External Orchestrator MCPB for Chat On Steroids Local Control API.",
+  "license": "MIT",
+  "engines": { "node": ">=20" },
+  "main": "dist/stdio.js",
+  "bin": { "cos-external-orchestrator": "dist/stdio.js" },
+  "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "validate:manifest": "mcpb validate manifest.json",
+    "validate": "npm run typecheck && npm run validate:manifest",
+    "package:mcpb": "node scripts/package-mcpb.mjs",
+    "verify:mcpb": "npm run package:mcpb && node scripts/verify-mcpb.mjs && node scripts/smoke-mcpb.mjs && node scripts/smoke-mcpb-controller.mjs",
+    "verify:mcpb:reproducible": "node scripts/verify-reproducible.mjs",
+    "verify": "npm run validate && npm test && npm run verify:mcpb && npm run verify:mcpb:reproducible"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.0.0",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@anthropic-ai/mcpb": "2.1.2",
+    "@types/node": "24.19.0",
+    "typescript": "7.0.2"
+  },
+  "overrides": { "@anthropic-ai/mcpb": { "tmp": "0.2.7" } }
+}
