@@ -448,7 +448,6 @@ async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
       else resolve();
     };
     const timer = setTimeout(() => finish(), ms);
-    timer.unref?.();
     const onAbort = (): void => finish(abortError());
     signal?.addEventListener('abort', onAbort, { once: true });
   });
